@@ -25,7 +25,7 @@ class TranscriptionResponse(BaseModel):
     model: Optional[str] = None
     
     class Config:
-        schema_extra = {"example": {"text": "Hello world", "segments": []}}
+        json_schema_extra = {"example": {"text": "Hello world", "segments": []}}
     
     def dict(self, **kwargs):
         """Custom dict method to handle response format"""

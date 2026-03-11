@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /c/_Dev/parakeet-diarized -maxdepth 2 -name *.py -not -path */venv/* -not -path */.git/*)",
+      "Bash(wsl bash:*)",
+      "Bash(grep -v \"^\\\\[NeMo\\\\|^$\\\\|FutureWarning\\\\|pynvml\\\\|import pynvml\\\\|warnings.warn\\\\|UserWarning\\\\|schema_extra\\\\|OneLogger\\\\|exporter\\\\|telemetry\\\\|RNNT Loss\\\\|fastemit\\\\|clamp\\\\|duration\\\\|sigma\\\\|omega\\\\|rnnt_models\\\\|modelPT\\\\|Tokenizer\\\\|If you intend\\\\|use_lhotse\\\\|skip_missing\\\\|input_cfg\\\\|tarred_audio\\\\|manifest_file\\\\|sample_rate\\\\|shuffle\\\\|num_workers\\\\|pin_memory\\\\|max_duration\\\\|min_duration\\\\|text_field\\\\|batch_duration\\\\|use_bucketing\\\\|bucket_duration\\\\|bucket_batch\\\\|num_buckets\\\\|bucket_buffer\\\\|shuffle_buffer\\\\|batch_size\\\\|mixins\\\\|Megatron\\\\|multistorage\\\\|mixed_prec\\\\|param_and\\\\|megatron_fsdp\\\\|numexpr\\\\|nv_one\")"
+    ]
+  }
+}

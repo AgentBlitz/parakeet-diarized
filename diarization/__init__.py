@@ -38,7 +38,9 @@ class Diarizer:
 
             if not self.access_token:
                 logger.warning("No access token provided. Using HUGGINGFACE_ACCESS_TOKEN environment variable.")
-                self.access_token = os.environ.get("HUGGINGFACE_ACCESS_TOKEN")
+                self.access_token = (
+                    os.environ.get("HUGGINGFACE_ACCESS_TOKEN") or os.environ.get("HF_TOKEN", "")
+                ).strip() or None
 
             if not self.access_token:
                 logger.error("No access token available. Diarization will not work.")
@@ -47,7 +49,7 @@ class Diarizer:
             # Initialize the pipeline
             self.pipeline = Pipeline.from_pretrained(
                 "pyannote/speaker-diarization-3.1",
-                use_auth_token=self.access_token
+                token=self.access_token
             )
 
             # Move to GPU if available
@@ -85,8 +87,30 @@ class Diarizer:
             segments = []
             speakers = set()
 
+            # Handle different return types across pyannote.audio versions:
+            # - 3.1: returns Annotation directly
+            # - 3.3+: returns SpeakerDiarizationOutput(diarization=Annotation, embeddings=...)
+            # - Some builds: returns a namedtuple where the Annotation is the first field
+            annotation = diarization
+            if not hasattr(diarization, 'itertracks'):
+                if hasattr(diarization, 'diarization'):
+                    annotation = diarization.diarization
+                elif hasattr(diarization, 'speaker_diarization'):
+                    # pyannote.audio 3.3+ DiarizeOutput namedtuple
+                    annotation = diarization.speaker_diarization
+                elif isinstance(diarization, tuple) and len(diarization) > 0:
+                    annotation = diarization[0]
+                else:
+                    logger.error(
+                        f"Unsupported diarization result type: {type(diarization).__name__}, "
+                        f"attrs: {[a for a in dir(diarization) if not a.startswith('_')]}"
+                    )
+                    raise AttributeError(
+                        f"Diarization result type '{type(diarization).__name__}' has no itertracks method"
+                    )
+
             # Process the diarization result
-            for turn, _, speaker in diarization.itertracks(yield_label=True):
+            for turn, _, speaker in annotation.itertracks(yield_label=True):
                 # Convert speaker label to consistent format
                 # This handles different formats from pyannote.audio versions
                 if isinstance(speaker, str) and not speaker.startswith("SPEAKER_"):

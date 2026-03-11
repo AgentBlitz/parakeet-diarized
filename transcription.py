@@ -21,11 +21,11 @@ def load_model(model_id: str = "nvidia/parakeet-tdt-0.6b-v2"):
         The loaded model
     """
     try:
-        from nemo.collections.asr.models import EncDecCTCModelBPE
+        from nemo.collections.asr.models import EncDecRNNTBPEModel
 
         logger.info(f"Loading model {model_id}")
-        # For Parakeet-TDT, we use the NeMo toolkit
-        model = EncDecCTCModelBPE.from_pretrained(model_id)
+        # parakeet-tdt is a TDT/RNNT model — use the correct class
+        model = EncDecRNNTBPEModel.from_pretrained(model_id)
 
         # Move model to GPU if available
         if torch.cuda.is_available():
@@ -125,28 +125,61 @@ def transcribe_audio_chunk(model, audio_path: str, language: Optional[str] = Non
         Tuple of (transcription text, list of WhisperSegment objects)
     """
     try:
+        # Validate chunk before sending to model
+        file_size = os.path.getsize(audio_path)
+        logger.info(f"Transcribing chunk: {audio_path}, size={file_size} bytes")
+        if file_size < 1000:
+            logger.warning(f"Chunk file suspiciously small ({file_size} bytes), skipping")
+            return "", []
+
         # Use the NeMo model to transcribe audio
+        # return_hypotheses=True is the NeMo 2.x API for getting Hypothesis objects
+        # with timestep data; timestamps=True triggers an internal unpack error in
+        # newer NeMo TDT decoders so we avoid it.
         with torch.no_grad():
-            # Simply pass the audio path(s) as a list to the transcribe method
-            transcription = model.transcribe(
-                [audio_path],
-                timestamps=True  # Always request timestamps for segmentation
-            )
+            try:
+                transcription = model.transcribe(
+                    [audio_path],
+                    return_hypotheses=True
+                )
+            except Exception as ts_err:
+                logger.warning(f"Transcription with return_hypotheses failed ({ts_err}), retrying plain")
+                transcription = model.transcribe([audio_path])
 
         # Extract the text from the result
         if not transcription or len(transcription) == 0:
             logger.warning(f"No transcription generated for {audio_path}")
             return "", []
 
-        result = transcription[0]  # Get the first result
-        text = result.text
+        # NeMo 2.0+ may return (List[str], List[Hypothesis]) tuple when return_hypotheses=True
+        # is triggered internally. Without it, it returns List[str] or List[Hypothesis].
+        result = transcription[0]
+        if isinstance(result, (list, tuple)):
+            # Unwrap one more level (e.g. NeMo 2.x returns ([text,...], [hyp,...]))
+            logger.debug(f"transcription[0] is {type(result).__name__}, unwrapping")
+            result = result[0] if len(result) > 0 else ""
+
+        text = result.text if hasattr(result, 'text') else str(result)
+        logger.info(f"Transcription result type={type(result).__name__}, text length={len(text)}, preview={repr(text[:80])}")
+        if not text:
+            ts_attrs = {a: type(getattr(result, a, None)).__name__ for a in ('timestamp', 'timestep', 'score', 'y_sequence')}
+            logger.warning(f"Empty transcription for {audio_path}. Hypothesis attrs: {ts_attrs}")
 
         # Create segments from the timestamp information if available
         segments = []
 
         # Check if we have timestamp information
-        if hasattr(result, 'timestamp') and 'segment' in result.timestamp:
-            for i, stamp in enumerate(result.timestamp['segment']):
+        # NeMo uses result.timestamp (older) or result.timestep (newer) keyed by 'segment'
+        ts_data = None
+        for attr in ('timestamp', 'timestep'):
+            candidate = getattr(result, attr, None)
+            # Use `is not None` to avoid `bool(tensor)` which raises for empty tensors
+            if candidate is not None and isinstance(candidate, dict) and 'segment' in candidate:
+                ts_data = candidate
+                break
+
+        if ts_data is not None:
+            for i, stamp in enumerate(ts_data['segment']):
                 segments.append(WhisperSegment(
                     id=i,
                     start=stamp['start'],

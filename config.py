@@ -25,10 +25,10 @@ DEBUG_MODE = os.environ.get("DEBUG", "0") == "1"
 # Model settings
 DEFAULT_MODEL_ID = "nvidia/parakeet-tdt-0.6b-v2"
 DEFAULT_TEMPERATURE = 0.0
-DEFAULT_CHUNK_DURATION = 500  # 5 minutes in seconds
+DEFAULT_CHUNK_DURATION = 30  # 30 seconds — NeMo's Lhotse dataloader drops samples > max_duration (40s)
 
-# Hugging Face configuration
-HF_TOKEN = os.environ.get("HUGGINGFACE_ACCESS_TOKEN")
+# Hugging Face configuration — strip \r in case the env var was set with Windows line endings
+HF_TOKEN = (os.environ.get("HUGGINGFACE_ACCESS_TOKEN") or os.environ.get("HF_TOKEN", "")).strip() or None
 
 # Diarization settings
 DEFAULT_DIARIZE = True

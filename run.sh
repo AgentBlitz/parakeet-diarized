@@ -58,6 +58,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Load .env if present and HF_TOKEN not already set
+if [[ -f ".env" && -z "$HF_TOKEN" ]]; then
+    export $(grep -v '^#' .env | xargs)
+fi
+
 echo -e "${GREEN}Starting Parakeet Whisper-Compatible API Server${NC}"
 
 # Check for ffmpeg

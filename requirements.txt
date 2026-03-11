@@ -1,4 +1,7 @@
 nemo_toolkit
+fiddle
+python-dotenv
+nvidia-ml-py
 fastapi
 uvicorn
 python-multipart
