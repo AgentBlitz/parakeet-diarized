@@ -22,6 +22,7 @@ def load_model(model_id: str = "nvidia/parakeet-tdt-0.6b-v2"):
     """
     try:
         from nemo.collections.asr.models import EncDecRNNTBPEModel
+        from omegaconf import open_dict
 
         logger.info(f"Loading model {model_id}")
         # parakeet-tdt is a TDT/RNNT model — use the correct class
@@ -33,6 +34,22 @@ def load_model(model_id: str = "nvidia/parakeet-tdt-0.6b-v2"):
             logger.info(f"Model loaded on GPU: {torch.cuda.get_device_name(0)}")
         else:
             logger.warning("CUDA not available, running on CPU (will be slow)")
+
+        # Disable CUDA graph decoder: cuda-python API changed (returns 5 values, NeMo
+        # expects 6), causing ValueError in TDT _full_graph_compile. The non-graph path
+        # is fully functional and produces correct transcriptions.
+        decoding_cfg = model.cfg.decoding
+        with open_dict(decoding_cfg):
+            decoding_cfg.greedy.use_cuda_graph_decoder = False
+            decoding_cfg.compute_timestamps = True
+        model.change_decoding_strategy(decoding_cfg)
+        logger.info("CUDA graph decoder disabled; compute_timestamps enabled")
+
+        # Pre-compute seconds-per-offset for timestamp conversion:
+        # offset units = encoder subsampling_factor × preprocessor window_stride
+        window_stride = model.cfg.preprocessor.window_stride  # e.g. 0.01s
+        subsampling = model.cfg.encoder.subsampling_factor     # e.g. 8
+        model._secs_per_offset = window_stride * subsampling   # e.g. 0.08s
 
         return model
     except Exception as e:
@@ -179,19 +196,25 @@ def transcribe_audio_chunk(model, audio_path: str, language: Optional[str] = Non
                 break
 
         if ts_data is not None:
+            # NeMo uses start_offset/end_offset (encoder frame indices).
+            # Convert to seconds: offset * window_stride * subsampling_factor
+            secs_per_offset = getattr(model, '_secs_per_offset', 0.08)
             for i, stamp in enumerate(ts_data['segment']):
+                # Older NeMo used 'start'/'end' keys; newer uses 'start_offset'/'end_offset'
+                start_off = stamp.get('start_offset', stamp.get('start', 0))
+                end_off = stamp.get('end_offset', stamp.get('end', 0))
                 segments.append(WhisperSegment(
                     id=i,
-                    start=stamp['start'],
-                    end=stamp['end'],
+                    start=round(start_off * secs_per_offset, 3),
+                    end=round(end_off * secs_per_offset, 3),
                     text=stamp['segment']
                 ))
         else:
-            # If no segments available, create a single segment for the entire chunk
+            # No timestamp data — create a single segment for the entire chunk
             segments.append(WhisperSegment(
                 id=0,
                 start=0.0,
-                end=len(text.split()) / 2.0,  # Rough estimate based on word count
+                end=0.0,
                 text=text
             ))
 

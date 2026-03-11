@@ -146,9 +146,9 @@ def create_app() -> FastAPI:
                     word_timestamps=word_timestamps
                 )
 
-                # Add offset to timestamps if not the first chunk
-                if i > 0:
-                    offset = i * chunk_duration
+                # Add the chunk's start time to all segment timestamps
+                offset = i * chunk_duration
+                if offset > 0:
                     for segment in chunk_segments:
                         segment.start += offset
                         segment.end += offset
