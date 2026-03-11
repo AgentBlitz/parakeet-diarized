@@ -31,7 +31,9 @@ def load_model(model_id: str = "nvidia/parakeet-tdt-0.6b-v2"):
         # Move model to GPU if available
         if torch.cuda.is_available():
             model = model.cuda()
-            logger.info(f"Model loaded on GPU: {torch.cuda.get_device_name(0)}")
+            model = model.half()  # fp16: ~2x GPU throughput; revert to remove this line if accuracy degrades
+            torch.backends.cudnn.benchmark = True  # auto-tune fastest convolution kernels for this GPU
+            logger.info(f"Model loaded on GPU (fp16): {torch.cuda.get_device_name(0)}")
         else:
             logger.warning("CUDA not available, running on CPU (will be slow)")
 

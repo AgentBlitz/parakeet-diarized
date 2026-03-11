@@ -3,6 +3,10 @@ import logging
 import uvicorn
 import torch
 
+# Use all CPU cores for numpy/numexpr operations (default is capped at 16)
+os.environ.setdefault("NUMEXPR_MAX_THREADS", str(os.cpu_count()))
+os.environ.setdefault("OMP_NUM_THREADS", str(os.cpu_count()))
+
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
