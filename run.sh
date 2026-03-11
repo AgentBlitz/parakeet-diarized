@@ -89,6 +89,9 @@ fi
 echo -e "${BLUE}Activating virtual environment...${NC}"
 source venv/bin/activate || { echo -e "${RED}Failed to activate virtual environment.${NC}"; exit 1; }
 
+# Remove old standalone pynvml package if present; nvidia-ml-py provides the same module
+pip show pynvml 2>/dev/null | grep -q "^Name: pynvml" && pip uninstall pynvml -y 2>/dev/null || true
+
 # Install requirements if needed
 if [ ! -f "venv/.requirements_installed" ] && [[ $CHECK_DEPS -eq 1 ]]; then
     echo -e "${YELLOW}Installing requirements...${NC}"
@@ -97,9 +100,9 @@ if [ ! -f "venv/.requirements_installed" ] && [[ $CHECK_DEPS -eq 1 ]]; then
 fi
 
 # Check for CUDA
-if python -c "import torch; print(torch.cuda.is_available())" | grep -q "True"; then
+if PYTHONWARNINGS="ignore::FutureWarning" python -c "import torch; print(torch.cuda.is_available())" | grep -q "True"; then
     echo -e "${GREEN}CUDA is available. Using GPU.${NC}"
-    CUDA_INFO=$(python -c "import torch; print(torch.cuda.get_device_name(0))")
+    CUDA_INFO=$(PYTHONWARNINGS="ignore::FutureWarning" python -c "import torch; print(torch.cuda.get_device_name(0))")
     echo -e "${GREEN}GPU Device: ${CUDA_INFO}${NC}"
 else
     echo -e "${YELLOW}WARNING: CUDA is not available. Using CPU, which will be much slower.${NC}"

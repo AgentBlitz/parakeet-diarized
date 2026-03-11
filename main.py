@@ -1,6 +1,13 @@
 import os
+import warnings
 import logging
 import uvicorn
+
+# Suppress pynvml FutureWarning from torch.cuda (old pynvml pkg installed alongside nvidia-ml-py)
+warnings.filterwarnings("ignore", category=FutureWarning, module="torch.cuda")
+# Suppress pyannote TF32 reproducibility warning (harmless for inference)
+warnings.filterwarnings("ignore", message=".*TensorFloat-32.*")
+
 import torch
 
 # Use all CPU cores for numpy/numexpr operations (default is capped at 16)
@@ -14,6 +21,16 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+# Suppress third-party library spam — none of these affect correctness
+for _noisy_logger in [
+    "megatron.core",
+    "nv_one_logger",
+    "nemo.collections.asr.models.rnnt_models",  # train/val config warnings at load time
+    "nemo.collections.asr.data.dataloader",     # pretokenize + use_start_end_token (per chunk)
+    "lhotse",                                   # per-chunk CutSet INFO
+]:
+    logging.getLogger(_noisy_logger).setLevel(logging.ERROR)
 
 # Enable debug logging if requested
 if os.environ.get('DEBUG', '0') == '1':
