@@ -1,3 +1,4 @@
+import asyncio
 import os
 import tempfile
 import logging
@@ -121,3 +122,62 @@ def convert_audio_to_wav(audio_path: str) -> str:
             except:
                 pass
         raise e
+
+
+async def split_audio_into_chunks_async(audio_path: str, chunk_duration: int = 300) -> List[str]:
+    """
+    Split a long audio file into smaller chunks in parallel using asyncio subprocesses.
+
+    Args:
+        audio_path: Path to the WAV audio file
+        chunk_duration: Duration of each chunk in seconds
+
+    Returns:
+        List of paths to the chunked audio files (in order)
+    """
+    try:
+        with wave.open(audio_path, 'rb') as wf:
+            duration = wf.getnframes() / wf.getframerate()
+
+        logger.info(f"Audio duration: {duration:.2f} seconds")
+
+        if duration <= chunk_duration:
+            logger.info("Audio is shorter than chunk duration, no splitting needed")
+            return [audio_path]
+
+        num_chunks = math.ceil(duration / chunk_duration)
+        logger.info(f"Splitting audio into {num_chunks} chunks (parallel)")
+
+        temp_dir = tempfile.mkdtemp()
+        chunk_paths = [os.path.join(temp_dir, f"chunk_{i}.wav") for i in range(num_chunks)]
+
+        # Cap concurrent ffmpeg processes to avoid I/O thrash
+        ffmpeg_sem = asyncio.Semaphore(8)
+
+        async def extract_chunk(i: int) -> None:
+            async with ffmpeg_sem:
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-ss", str(i * chunk_duration),
+                    "-i", audio_path,
+                    "-t", str(chunk_duration),
+                    "-c:a", "pcm_s16le",
+                    "-ar", "16000",
+                    "-ac", "1",
+                    chunk_paths[i]
+                ]
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                _, stderr = await proc.communicate()
+                if proc.returncode != 0:
+                    raise RuntimeError(f"ffmpeg chunk {i} failed: {stderr.decode()}")
+
+        await asyncio.gather(*[extract_chunk(i) for i in range(num_chunks)])
+        return chunk_paths
+
+    except Exception as e:
+        logger.error(f"Error splitting audio (async): {str(e)}")
+        return [audio_path]

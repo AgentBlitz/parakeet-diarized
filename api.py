@@ -1,5 +1,7 @@
+import asyncio
 import os
 import logging
+from functools import partial
 from typing import List, Optional, Dict, Any, Union
 from pathlib import Path
 
@@ -9,16 +11,20 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 import torch
 
 from models import WhisperSegment, TranscriptionResponse, ModelInfo, ModelList
-from audio import convert_audio_to_wav, split_audio_into_chunks
-from transcription import load_model, format_srt, format_vtt, transcribe_audio_chunk
+from audio import convert_audio_to_wav, split_audio_into_chunks_async
+from transcription import load_model, format_srt, format_vtt, transcribe_audio_batch
 from diarization import Diarizer
 from config import get_config
 
 # Initialize logging
 logger = logging.getLogger(__name__)
 
-# Global variable for model
+# Global model and per-operation GPU semaphores
+# transcribe_semaphore: serializes model.transcribe() calls (NeMo not thread-safe)
+# diarize_semaphore: serializes pyannote diarization (runs concurrently with transcription)
 asr_model = None
+transcribe_semaphore: asyncio.Semaphore = None
+diarize_semaphore: asyncio.Semaphore = None
 
 # Get configuration
 config = get_config()
@@ -44,7 +50,14 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     async def startup_event():
         """Initialize resources during startup"""
-        global asr_model
+        global asr_model, transcribe_semaphore, diarize_semaphore
+
+        transcribe_semaphore = asyncio.Semaphore(config.max_concurrent_requests)
+        diarize_semaphore = asyncio.Semaphore(config.max_concurrent_diarize)
+        logger.info(
+            f"Semaphores initialized — transcribe={config.max_concurrent_requests}, "
+            f"diarize={config.max_concurrent_diarize}"
+        )
 
         try:
             # Check CUDA availability
@@ -90,7 +103,7 @@ def create_app() -> FastAPI:
         This endpoint is compatible with the OpenAI Whisper API
         """
 
-        global asr_model
+        global asr_model, transcribe_semaphore, diarize_semaphore
 
         if not asr_model:
             raise HTTPException(status_code=503, detail="Model not loaded yet. Please try again in a few moments.")
@@ -99,6 +112,8 @@ def create_app() -> FastAPI:
         logger.info(f"Transcription requested: {file.filename}, format: {response_format}")
 
         try:
+            # --- Phase 1: File I/O (no GPU semaphore — runs concurrently with other requests) ---
+
             # Save uploaded file to temp location
             temp_dir = Path(config.temp_dir)
             temp_dir.mkdir(parents=True, exist_ok=True)
@@ -108,12 +123,14 @@ def create_app() -> FastAPI:
                 content = await file.read()
                 f.write(content)
 
-            # Convert to WAV format
-            wav_file = convert_audio_to_wav(str(temp_file))
-
-            # Split audio into chunks if it's too long
             chunk_duration = config.chunk_duration
-            audio_chunks = split_audio_into_chunks(wav_file, chunk_duration=chunk_duration)
+            loop = asyncio.get_event_loop()
+
+            # Convert to WAV in a thread (blocking subprocess)
+            wav_file = await loop.run_in_executor(None, convert_audio_to_wav, str(temp_file))
+
+            # Split into chunks in parallel (async subprocesses)
+            audio_chunks = await split_audio_into_chunks_async(wav_file, chunk_duration=chunk_duration)
 
             # Initialize diarization if requested
             diarizer = None
@@ -124,35 +141,53 @@ def create_app() -> FastAPI:
                 else:
                     logger.warning("Diarization requested but no HuggingFace token available")
 
-            # Process speaker diarization if requested
+            # --- Phase 2: GPU work (diarization and transcription run concurrently) ---
+            # diarize_semaphore and transcribe_semaphore are independent — both can run at
+            # the same time on the RTX 4090 (pyannote ~2-4GB, NeMo fp16 ~1.5GB + batch).
             diarization_result = None
-            if diarizer:
-                logger.info("Performing speaker diarization")
-                diarization_result = diarizer.diarize(wav_file)
-                logger.info(f"Diarization found {diarization_result.num_speakers} speakers")
+            batch_results = []
 
-            # Process each chunk
+            async def _run_diarize():
+                async with diarize_semaphore:
+                    logger.info("Performing speaker diarization")
+                    result = await loop.run_in_executor(
+                        None, partial(diarizer.diarize, wav_file)
+                    )
+                    logger.info(f"Diarization found {result.num_speakers} speakers")
+                    return result
+
+            # Start diarization as a background task (if requested)
+            diarize_task = asyncio.create_task(_run_diarize()) if diarizer else None
+
+            # Run transcription under its own semaphore (concurrent with diarization)
+            logger.info(f"Batch transcribing {len(audio_chunks)} chunk(s) with batch_size={config.batch_size}")
+            async with transcribe_semaphore:
+                batch_results = await loop.run_in_executor(
+                    None,
+                    partial(
+                        transcribe_audio_batch,
+                        asr_model,
+                        audio_chunks,
+                        config.batch_size,
+                        language,
+                        word_timestamps
+                    )
+                )
+
+            # Wait for diarization to finish (usually already done by now)
+            if diarize_task:
+                diarization_result = await diarize_task
+
+            # --- Phase 3: Assemble results (no GPU) ---
             all_text = []
             all_segments = []
 
-            for i, chunk_path in enumerate(audio_chunks):
-                logger.info(f"Processing chunk {i+1}/{len(audio_chunks)}")
-
-                # Transcribe the chunk
-                chunk_text, chunk_segments = transcribe_audio_chunk(
-                    asr_model,
-                    chunk_path,
-                    language=language,
-                    word_timestamps=word_timestamps
-                )
-
-                # Add the chunk's start time to all segment timestamps
+            for i, (chunk_text, chunk_segments) in enumerate(batch_results):
                 offset = i * chunk_duration
                 if offset > 0:
                     for segment in chunk_segments:
                         segment.start += offset
                         segment.end += offset
-
                 all_text.append(chunk_text)
                 all_segments.extend(chunk_segments)
 

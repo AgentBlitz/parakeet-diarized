@@ -67,6 +67,11 @@ class Config:
         self.default_num_speakers = DEFAULT_NUM_SPEAKERS
 
 
+        # Concurrency / throughput settings
+        self.batch_size = int(os.environ.get("BATCH_SIZE", 16))
+        self.max_concurrent_requests = int(os.environ.get("MAX_CONCURRENT_REQUESTS", 1))
+        self.max_concurrent_diarize = int(os.environ.get("MAX_CONCURRENT_DIARIZE", 1))
+
         # File paths
         self.temp_dir = os.environ.get("TEMP_DIR", "/tmp/parakeet")
         Path(self.temp_dir).mkdir(parents=True, exist_ok=True)
@@ -93,7 +98,10 @@ class Config:
             "chunk_duration": self.chunk_duration,
             "enable_diarization": self.enable_diarization,
             "include_diarization_in_text": self.include_diarization_in_text,
-            "has_hf_token": self.hf_token is not None
+            "has_hf_token": self.hf_token is not None,
+            "batch_size": self.batch_size,
+            "max_concurrent_requests": self.max_concurrent_requests,
+            "max_concurrent_diarize": self.max_concurrent_diarize
         }
 
 

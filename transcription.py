@@ -129,10 +129,119 @@ def format_vtt(segments: List[WhisperSegment]) -> str:
 
     return vtt_content.strip()
 
-def transcribe_audio_chunk(model, audio_path: str, language: Optional[str] = None,
-                          word_timestamps: bool = False) -> Tuple[str, List[WhisperSegment]]:
+def _parse_hypothesis(result, model) -> Tuple[str, List[WhisperSegment]]:
     """
-    Transcribe a single audio chunk using the Parakeet-TDT model
+    Parse one NeMo Hypothesis (or plain string fallback) into (text, segments).
+    Timestamps are relative to the chunk start (0-based); callers apply offsets.
+    """
+    # NeMo 2.x may return ([text,...], [hyp,...]) tuple as first element — unwrap
+    if isinstance(result, (list, tuple)):
+        logger.debug(f"result is {type(result).__name__}, unwrapping")
+        result = result[0] if len(result) > 0 else ""
+
+    text = result.text if hasattr(result, 'text') else str(result)
+    logger.info(f"Parsed hypothesis type={type(result).__name__}, text length={len(text)}, preview={repr(text[:80])}")
+    if not text:
+        ts_attrs = {a: type(getattr(result, a, None)).__name__ for a in ('timestamp', 'timestep', 'score', 'y_sequence')}
+        logger.warning(f"Empty transcription. Hypothesis attrs: {ts_attrs}")
+
+    segments = []
+
+    # NeMo uses result.timestamp (older) or result.timestep (newer) keyed by 'segment'
+    ts_data = None
+    for attr in ('timestamp', 'timestep'):
+        candidate = getattr(result, attr, None)
+        # Use `is not None` to avoid `bool(tensor)` which raises for empty tensors
+        if candidate is not None and isinstance(candidate, dict) and 'segment' in candidate:
+            ts_data = candidate
+            break
+
+    if ts_data is not None:
+        secs_per_offset = getattr(model, '_secs_per_offset', 0.08)
+        for i, stamp in enumerate(ts_data['segment']):
+            start_off = stamp.get('start_offset', stamp.get('start', 0))
+            end_off = stamp.get('end_offset', stamp.get('end', 0))
+            segments.append(WhisperSegment(
+                id=i,
+                start=round(start_off * secs_per_offset, 3),
+                end=round(end_off * secs_per_offset, 3),
+                text=stamp['segment']
+            ))
+    else:
+        segments.append(WhisperSegment(id=0, start=0.0, end=0.0, text=text))
+
+    return text, segments
+
+
+def transcribe_audio_batch(
+    model,
+    audio_paths: List[str],
+    batch_size: int = 8,
+    language: Optional[str] = None,
+    word_timestamps: bool = False
+) -> List[Tuple[str, List[WhisperSegment]]]:
+    """
+    Transcribe all audio chunks in a single model.transcribe() call.
+
+    NeMo handles internal batching so the GPU processes `batch_size` chunks at once,
+    maximising throughput. Returns results in the same order as audio_paths.
+    Silent/tiny chunks (< 1000 bytes) are skipped and return ("", []).
+
+    Args:
+        model: Loaded ASR model
+        audio_paths: Ordered list of chunk file paths
+        batch_size: How many chunks the model processes per GPU batch
+        language: Optional language hint (not used by NeMo TDT, kept for API compat)
+        word_timestamps: Whether to include word-level timestamps
+
+    Returns:
+        List of (text, segments) tuples in the same order as audio_paths
+    """
+    results: List[Tuple[str, List[WhisperSegment]]] = [("", []) for _ in audio_paths]
+
+    # Filter out tiny/silent chunks, preserving original indices
+    valid = [(i, p) for i, p in enumerate(audio_paths)
+             if os.path.getsize(p) >= 1000]
+    if not valid:
+        logger.warning("All chunks are too small — nothing to transcribe")
+        return results
+
+    valid_indices, valid_paths = zip(*valid)
+    logger.info(f"Batch transcribing {len(valid_paths)} chunk(s) with batch_size={batch_size}")
+
+    with torch.no_grad():
+        try:
+            transcriptions = model.transcribe(
+                list(valid_paths),
+                batch_size=batch_size,
+                return_hypotheses=True
+            )
+        except Exception as e:
+            logger.warning(f"Batch transcription with return_hypotheses failed ({e}), retrying plain")
+            transcriptions = model.transcribe(list(valid_paths), batch_size=batch_size)
+
+    if not transcriptions or len(transcriptions) == 0:
+        logger.warning("model.transcribe() returned empty result")
+        return results
+
+    # NeMo 2.x may return (List[str], List[Hypothesis]) — use the hypotheses list
+    if (isinstance(transcriptions, (list, tuple))
+            and len(transcriptions) == 2
+            and isinstance(transcriptions[0], list)
+            and isinstance(transcriptions[1], list)):
+        logger.debug("Unwrapping NeMo 2.x (texts, hypotheses) tuple")
+        transcriptions = transcriptions[1]
+
+    for orig_i, hyp in zip(valid_indices, transcriptions):
+        results[orig_i] = _parse_hypothesis(hyp, model)
+
+    return results
+
+
+def transcribe_audio_chunk(model, audio_path: str, language: Optional[str] = None,
+                           word_timestamps: bool = False) -> Tuple[str, List[WhisperSegment]]:
+    """
+    Transcribe a single audio chunk. Delegates to transcribe_audio_batch for consistency.
 
     Args:
         model: The loaded ASR model
@@ -143,85 +252,17 @@ def transcribe_audio_chunk(model, audio_path: str, language: Optional[str] = Non
     Returns:
         Tuple of (transcription text, list of WhisperSegment objects)
     """
+    file_size = os.path.getsize(audio_path)
+    logger.info(f"Transcribing chunk: {audio_path}, size={file_size} bytes")
+    if file_size < 1000:
+        logger.warning(f"Chunk file suspiciously small ({file_size} bytes), skipping")
+        return "", []
+
     try:
-        # Validate chunk before sending to model
-        file_size = os.path.getsize(audio_path)
-        logger.info(f"Transcribing chunk: {audio_path}, size={file_size} bytes")
-        if file_size < 1000:
-            logger.warning(f"Chunk file suspiciously small ({file_size} bytes), skipping")
-            return "", []
-
-        # Use the NeMo model to transcribe audio
-        # return_hypotheses=True is the NeMo 2.x API for getting Hypothesis objects
-        # with timestep data; timestamps=True triggers an internal unpack error in
-        # newer NeMo TDT decoders so we avoid it.
-        with torch.no_grad():
-            try:
-                transcription = model.transcribe(
-                    [audio_path],
-                    return_hypotheses=True
-                )
-            except Exception as ts_err:
-                logger.warning(f"Transcription with return_hypotheses failed ({ts_err}), retrying plain")
-                transcription = model.transcribe([audio_path])
-
-        # Extract the text from the result
-        if not transcription or len(transcription) == 0:
-            logger.warning(f"No transcription generated for {audio_path}")
-            return "", []
-
-        # NeMo 2.0+ may return (List[str], List[Hypothesis]) tuple when return_hypotheses=True
-        # is triggered internally. Without it, it returns List[str] or List[Hypothesis].
-        result = transcription[0]
-        if isinstance(result, (list, tuple)):
-            # Unwrap one more level (e.g. NeMo 2.x returns ([text,...], [hyp,...]))
-            logger.debug(f"transcription[0] is {type(result).__name__}, unwrapping")
-            result = result[0] if len(result) > 0 else ""
-
-        text = result.text if hasattr(result, 'text') else str(result)
-        logger.info(f"Transcription result type={type(result).__name__}, text length={len(text)}, preview={repr(text[:80])}")
-        if not text:
-            ts_attrs = {a: type(getattr(result, a, None)).__name__ for a in ('timestamp', 'timestep', 'score', 'y_sequence')}
-            logger.warning(f"Empty transcription for {audio_path}. Hypothesis attrs: {ts_attrs}")
-
-        # Create segments from the timestamp information if available
-        segments = []
-
-        # Check if we have timestamp information
-        # NeMo uses result.timestamp (older) or result.timestep (newer) keyed by 'segment'
-        ts_data = None
-        for attr in ('timestamp', 'timestep'):
-            candidate = getattr(result, attr, None)
-            # Use `is not None` to avoid `bool(tensor)` which raises for empty tensors
-            if candidate is not None and isinstance(candidate, dict) and 'segment' in candidate:
-                ts_data = candidate
-                break
-
-        if ts_data is not None:
-            # NeMo uses start_offset/end_offset (encoder frame indices).
-            # Convert to seconds: offset * window_stride * subsampling_factor
-            secs_per_offset = getattr(model, '_secs_per_offset', 0.08)
-            for i, stamp in enumerate(ts_data['segment']):
-                # Older NeMo used 'start'/'end' keys; newer uses 'start_offset'/'end_offset'
-                start_off = stamp.get('start_offset', stamp.get('start', 0))
-                end_off = stamp.get('end_offset', stamp.get('end', 0))
-                segments.append(WhisperSegment(
-                    id=i,
-                    start=round(start_off * secs_per_offset, 3),
-                    end=round(end_off * secs_per_offset, 3),
-                    text=stamp['segment']
-                ))
-        else:
-            # No timestamp data — create a single segment for the entire chunk
-            segments.append(WhisperSegment(
-                id=0,
-                start=0.0,
-                end=0.0,
-                text=text
-            ))
-
-        return text, segments
-
+        return transcribe_audio_batch(
+            model, [audio_path], batch_size=1,
+            language=language, word_timestamps=word_timestamps
+        )[0]
     except Exception as e:
         logger.error(f"Error transcribing audio chunk: {str(e)}")
         return "", []

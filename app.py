@@ -1,5 +1,6 @@
-import tempfile
 import os
+import tempfile
+import zipfile
 from datetime import datetime
 
 import gradio as gr
@@ -89,7 +90,7 @@ def build_markdown(segments: list, speaker_df: pd.DataFrame) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Core functions wired to Gradio events
+# Single-file functions
 # ---------------------------------------------------------------------------
 
 def transcribe(audio_path: str):
@@ -187,63 +188,271 @@ def export_markdown(segments: list, speaker_df: pd.DataFrame):
 
 
 # ---------------------------------------------------------------------------
+# Batch functions
+# ---------------------------------------------------------------------------
+
+def _call_api(file_path: str) -> dict:
+    """Call the transcription API for a single file. Returns parsed JSON."""
+    with open(file_path, "rb") as f:
+        resp = requests.post(
+            API_URL,
+            files={"file": (os.path.basename(file_path), f)},
+            data={
+                "model": "whisper-1",
+                "response_format": "verbose_json",
+                "timestamps": "true",
+                "diarize": "true",
+                "include_diarization_in_text": "false",
+            },
+            timeout=600,
+        )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def transcribe_batch(file_objs):
+    """
+    Process multiple files sequentially, streaming progress after each file.
+    Yields: (status_rows, results_or_NO_UPDATE, progress_text)
+
+    Intermediate yields use gr.update() (no-op) for the State so Gradio does NOT
+    reset the state or fire .change events until the final yield delivers results.
+    """
+    if not file_objs:
+        yield [], [], ""
+        return
+
+    # Gradio may pass a list of dicts with 'name'/'path' key or plain strings
+    paths = []
+    for f in file_objs:
+        if isinstance(f, dict):
+            paths.append(f.get("name") or f.get("path", ""))
+        else:
+            paths.append(str(f))
+
+    total = len(paths)
+    results = []
+    status_rows = []
+
+    for idx, path in enumerate(paths):
+        name = os.path.basename(path)
+        pct = int(idx / total * 100)
+        progress_text = f"**Processing file {idx + 1} of {total}** ({pct}%)"
+
+        # gr.update() with no args = leave the State unchanged (don't trigger .change)
+        yield status_rows + [[name, "Processing…", "–", "–"]], gr.update(), progress_text
+
+        try:
+            data = _call_api(path)
+            segments = data.get("segments", [])
+            speakers = len({s.get("speaker") for s in segments if s.get("speaker")})
+            results.append({"name": name, "path": path, "segments": segments})
+            status_rows.append([name, "Done ✓", str(speakers), str(len(segments))])
+        except requests.exceptions.ConnectionError:
+            status_rows.append([name, "Error: server not running", "–", "–"])
+        except Exception as e:
+            status_rows.append([name, f"Error: {e}", "–", "–"])
+
+        yield status_rows, gr.update(), progress_text
+
+    done_count = sum(1 for r in status_rows if r[1].startswith("Done"))
+    yield status_rows, results, f"**Done — {done_count} of {total} files completed.**"
+
+
+def _get_batch_choices(results: list):
+    """Populate dropdown with names of successfully transcribed files."""
+    choices = [r["name"] for r in results] if results else []
+    return gr.update(choices=choices, value=choices[0] if choices else None)
+
+
+def _view_batch_transcript(results: list, selected_name: str) -> str:
+    """Render markdown for the selected file."""
+    if not results or not selected_name:
+        return ""
+    empty_df = pd.DataFrame({"Detected Label": [], "Name": []})
+    for r in results:
+        if r["name"] == selected_name:
+            return build_markdown(r["segments"], empty_df)
+    return ""
+
+
+def _export_single_batch(results: list, selected_name: str):
+    """Write selected file's transcript to a temp .md and return its path."""
+    if not results or not selected_name:
+        return None
+    empty_df = pd.DataFrame({"Detected Label": [], "Name": []})
+    for r in results:
+        if r["name"] == selected_name:
+            md = build_markdown(r["segments"], empty_df)
+            stem = os.path.splitext(selected_name)[0]
+            tmp = tempfile.NamedTemporaryFile(
+                suffix=".md", prefix=f"{stem}_", delete=False, mode="w", encoding="utf-8"
+            )
+            tmp.write(md)
+            tmp.close()
+            return tmp.name
+    return None
+
+
+def export_batch_zip(results: list):
+    """Create a ZIP of per-file .md transcripts."""
+    if not results:
+        return None
+
+    empty_df = pd.DataFrame({"Detected Label": [], "Name": []})
+    tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+    tmp.close()
+
+    with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as zf:
+        for r in results:
+            md = build_markdown(r["segments"], empty_df)
+            stem = os.path.splitext(r["name"])[0]
+            zf.writestr(f"{stem}.md", md)
+
+    return tmp.name
+
+
+# ---------------------------------------------------------------------------
 # Gradio UI
 # ---------------------------------------------------------------------------
 
-with gr.Blocks(title="Parakeet Transcriber", theme=gr.themes.Soft()) as demo:
-    segments_state = gr.State([])
+with gr.Blocks(title="Parakeet Transcriber") as demo:
 
-    gr.Markdown("# Parakeet Transcriber\nUpload an audio file, transcribe it, rename speakers, then export.")
+    with gr.Tabs():
 
-    with gr.Row():
-        # --- Left panel ---
-        with gr.Column(scale=1, min_width=280):
-            audio_input = gr.Audio(
-                sources=["microphone", "upload"],
-                type="filepath",
-                label="Audio (record or upload)",
+        # ── Single File tab ───────────────────────────────────────────────
+        with gr.Tab("Single File"):
+            segments_state = gr.State([])
+
+            gr.Markdown("Upload or record audio, transcribe it, rename speakers, then export.")
+
+            with gr.Row():
+                with gr.Column(scale=1, min_width=280):
+                    audio_input = gr.Audio(
+                        sources=["microphone", "upload"],
+                        type="filepath",
+                        label="Audio (record or upload)",
+                    )
+                    transcribe_btn = gr.Button("Transcribe", variant="primary", size="lg")
+                    status_md = gr.Markdown("")
+
+                with gr.Column(scale=2):
+                    with gr.Group(visible=False) as results_group:
+                        speaker_table = gr.Dataframe(
+                            headers=["Detected Label", "Name"],
+                            datatype=["str", "str"],
+                            label="Rename Speakers  (edit the Name column)",
+                            interactive=True,
+                            wrap=True,
+                            row_count=(1, "dynamic"),
+                            column_count=(2, "fixed"),
+                        )
+                        preview_md = gr.Markdown(label="Transcript Preview")
+                        export_btn = gr.DownloadButton(
+                            "Export Markdown",
+                            variant="secondary",
+                            visible=True,
+                        )
+
+            transcribe_btn.click(
+                fn=transcribe,
+                inputs=[audio_input],
+                outputs=[segments_state, speaker_table, results_group, status_md, preview_md],
             )
-            transcribe_btn = gr.Button("Transcribe", variant="primary", size="lg")
-            status_md = gr.Markdown("")
+            speaker_table.change(
+                fn=update_preview,
+                inputs=[segments_state, speaker_table],
+                outputs=[preview_md],
+            )
+            export_btn.click(
+                fn=export_markdown,
+                inputs=[segments_state, speaker_table],
+                outputs=[export_btn],
+            )
 
-        # --- Right panel (hidden until transcription complete) ---
-        with gr.Column(scale=2):
-            with gr.Group(visible=False) as results_group:
-                speaker_table = gr.Dataframe(
-                    headers=["Detected Label", "Name"],
-                    datatype=["str", "str"],
-                    label="Rename Speakers  (edit the Name column)",
+        # ── Batch tab ─────────────────────────────────────────────────────
+        with gr.Tab("Batch"):
+            batch_results_state = gr.State([])
+
+            gr.Markdown(
+                "Drop multiple audio files. Each is sent to the server in turn "
+                "(GPU work is queued automatically)."
+            )
+
+            with gr.Row():
+                # Left: controls + progress
+                with gr.Column(scale=1, min_width=280):
+                    batch_input = gr.File(
+                        file_count="multiple",
+                        file_types=["audio", ".m4a", ".mp3", ".wav", ".ogg", ".flac", ".webm"],
+                        label="Audio files",
+                    )
+                    batch_btn = gr.Button("Process All", variant="primary", size="lg")
+                    batch_status_md = gr.Markdown("")
+
+                # Right: progress table
+                with gr.Column(scale=2):
+                    batch_table = gr.Dataframe(
+                        headers=["File", "Status", "Speakers", "Segments"],
+                        datatype=["str", "str", "str", "str"],
+                        label="Progress",
+                        interactive=False,
+                        wrap=True,
+                    )
+
+            # Results panel — hidden until batch completes
+            with gr.Group(visible=False) as batch_results_group:
+                gr.Markdown("---")
+                batch_file_select = gr.Dropdown(
+                    label="View transcript",
+                    choices=[],
                     interactive=True,
-                    wrap=True,
-                    row_count=(1, "dynamic"),
-                    col_count=(2, "fixed"),
                 )
-                preview_md = gr.Markdown(label="Transcript Preview")
-                export_btn = gr.DownloadButton(
-                    "Export Markdown",
-                    variant="secondary",
-                    visible=True,
-                )
+                batch_preview_md = gr.Markdown()
+                with gr.Row():
+                    batch_download_one_btn = gr.DownloadButton(
+                        "Download Selected .md",
+                        variant="secondary",
+                    )
+                    batch_export_btn = gr.DownloadButton(
+                        "Export All (ZIP)",
+                        variant="secondary",
+                    )
 
-    # --- Events ---
-    transcribe_btn.click(
-        fn=transcribe,
-        inputs=[audio_input],
-        outputs=[segments_state, speaker_table, results_group, status_md, preview_md],
-    )
+            # --- Wiring ---
 
-    speaker_table.change(
-        fn=update_preview,
-        inputs=[segments_state, speaker_table],
-        outputs=[preview_md],
-    )
-
-    export_btn.click(
-        fn=export_markdown,
-        inputs=[segments_state, speaker_table],
-        outputs=[export_btn],
-    )
+            batch_btn.click(
+                fn=transcribe_batch,
+                inputs=[batch_input],
+                outputs=[batch_table, batch_results_state, batch_status_md],
+            )
+            batch_results_state.change(
+                fn=_get_batch_choices,
+                inputs=[batch_results_state],
+                outputs=[batch_file_select],
+            )
+            batch_results_state.change(
+                fn=lambda r: gr.update(visible=bool(r)),
+                inputs=[batch_results_state],
+                outputs=[batch_results_group],
+            )
+            batch_file_select.change(
+                fn=_view_batch_transcript,
+                inputs=[batch_results_state, batch_file_select],
+                outputs=[batch_preview_md],
+            )
+            batch_download_one_btn.click(
+                fn=_export_single_batch,
+                inputs=[batch_results_state, batch_file_select],
+                outputs=[batch_download_one_btn],
+            )
+            batch_export_btn.click(
+                fn=export_batch_zip,
+                inputs=[batch_results_state],
+                outputs=[batch_export_btn],
+            )
 
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860, inbrowser=True)
+    demo.queue()  # required for generator streaming (live progress updates)
+    demo.launch(server_name="0.0.0.0", server_port=7860, inbrowser=True, theme=gr.themes.Soft())
