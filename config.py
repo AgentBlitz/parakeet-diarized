@@ -72,6 +72,31 @@ class Config:
         self.max_concurrent_requests = int(os.environ.get("MAX_CONCURRENT_REQUESTS", 1))
         self.max_concurrent_diarize = int(os.environ.get("MAX_CONCURRENT_DIARIZE", 1))
 
+        # Diarization GPU batch sizes — pyannote defaults both to 1, severely underutilizing GPU
+        self.diarize_segmentation_batch_size = int(os.environ.get("DIARIZE_SEGMENTATION_BATCH_SIZE", "8").strip())
+        self.diarize_embedding_batch_size = int(os.environ.get("DIARIZE_EMBEDDING_BATCH_SIZE", "8").strip())
+
+        # Segmentation step — ratio of window duration. Default 0.1 = 90% overlap between
+        # consecutive windows. Higher = fewer windows = fewer embeddings = faster.
+        # 0.1 = ~1400 windows for 23min audio. 0.5 = ~280 windows (5x fewer embeddings).
+        # Trade-off: higher step = less precise speaker boundaries.
+        self.diarize_segmentation_step = float(os.environ.get("DIARIZE_SEGMENTATION_STEP", "0.3").strip())
+
+        # torch.compile() — opt-in encoder compilation for GPU speedup
+        # Default mode is "default" (inductor backend). "reduce-overhead" requires nvcc which
+        # may not be accessible in WSL. "max-autotune" is slowest to compile but fastest to run.
+        self.torch_compile = os.environ.get("TORCH_COMPILE", "false").strip().lower() == "true"
+        self.torch_compile_mode = os.environ.get("TORCH_COMPILE_MODE", "default").strip()
+
+        # Request timeout (seconds) — 0 means no timeout
+        self.request_timeout = float(os.environ.get("REQUEST_TIMEOUT", "300").strip())
+        if self.request_timeout <= 0:
+            self.request_timeout = None  # asyncio.wait_for treats None as no timeout
+
+        # Cross-request batch queue
+        self.enable_batch_queue = os.environ.get("ENABLE_BATCH_QUEUE", "false").strip().lower() == "true"
+        self.batch_queue_max_wait = float(os.environ.get("BATCH_QUEUE_MAX_WAIT", "0.5").strip())
+
         # File paths
         self.temp_dir = os.environ.get("TEMP_DIR", "/tmp/parakeet")
         Path(self.temp_dir).mkdir(parents=True, exist_ok=True)
@@ -101,7 +126,14 @@ class Config:
             "has_hf_token": self.hf_token is not None,
             "batch_size": self.batch_size,
             "max_concurrent_requests": self.max_concurrent_requests,
-            "max_concurrent_diarize": self.max_concurrent_diarize
+            "max_concurrent_diarize": self.max_concurrent_diarize,
+            "diarize_segmentation_batch_size": self.diarize_segmentation_batch_size,
+            "diarize_embedding_batch_size": self.diarize_embedding_batch_size,
+            "diarize_segmentation_step": self.diarize_segmentation_step,
+            "torch_compile": self.torch_compile,
+            "torch_compile_mode": self.torch_compile_mode,
+            "request_timeout": self.request_timeout,
+            "enable_batch_queue": self.enable_batch_queue,
         }
 
 

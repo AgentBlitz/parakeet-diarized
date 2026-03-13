@@ -1,6 +1,7 @@
 import os
 import logging
 import tempfile
+import time
 from typing import List, Optional, Dict, Any, Union, Tuple
 
 import torch
@@ -52,6 +53,24 @@ def load_model(model_id: str = "nvidia/parakeet-tdt-0.6b-v2"):
         window_stride = model.cfg.preprocessor.window_stride  # e.g. 0.01s
         subsampling = model.cfg.encoder.subsampling_factor     # e.g. 8
         model._secs_per_offset = window_stride * subsampling   # e.g. 0.08s
+
+        # Optional: torch.compile() on the encoder for kernel fusion speedup.
+        # Only the encoder (Conformer stack) is compiled — the RNNT decoder has
+        # dynamic control flow (beam search loops) that torch.compile struggles with.
+        # First model.transcribe() call will be slow (30-120s compilation overhead).
+        from config import get_config
+        cfg = get_config()
+        if cfg.torch_compile and torch.cuda.is_available():
+            try:
+                logger.info(f"Applying torch.compile(mode='{cfg.torch_compile_mode}') to encoder...")
+                model.encoder = torch.compile(
+                    model.encoder,
+                    mode=cfg.torch_compile_mode,
+                    dynamic=True  # handles varying batch sizes without recompilation
+                )
+                logger.info("torch.compile() applied to encoder — first transcription will include compilation overhead")
+            except Exception as e:
+                logger.warning(f"torch.compile() failed, falling back to eager mode: {e}")
 
         return model
     except Exception as e:
@@ -209,6 +228,12 @@ def transcribe_audio_batch(
     valid_indices, valid_paths = zip(*valid)
     logger.info(f"Batch transcribing {len(valid_paths)} chunk(s) with batch_size={batch_size}")
 
+    # Log GPU memory before transcription
+    if torch.cuda.is_available():
+        mem_before = torch.cuda.memory_allocated() / 1024 / 1024
+        logger.info(f"GPU memory before transcribe: {mem_before:.1f} MB")
+
+    t_start = time.perf_counter()
     with torch.no_grad():
         try:
             transcriptions = model.transcribe(
@@ -219,6 +244,16 @@ def transcribe_audio_batch(
         except Exception as e:
             logger.warning(f"Batch transcription with return_hypotheses failed ({e}), retrying plain")
             transcriptions = model.transcribe(list(valid_paths), batch_size=batch_size)
+    t_elapsed = time.perf_counter() - t_start
+
+    # Log GPU memory after transcription and timing
+    if torch.cuda.is_available():
+        mem_after = torch.cuda.memory_allocated() / 1024 / 1024
+        mem_peak = torch.cuda.max_memory_allocated() / 1024 / 1024
+        logger.info(
+            f"model.transcribe() took {t_elapsed:.2f}s for {len(valid_paths)} chunks | "
+            f"GPU mem: {mem_after:.1f} MB (peak {mem_peak:.1f} MB)"
+        )
 
     if not transcriptions or len(transcriptions) == 0:
         logger.warning("model.transcribe() returned empty result")

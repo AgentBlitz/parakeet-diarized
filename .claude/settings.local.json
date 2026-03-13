@@ -9,7 +9,31 @@
       "Bash(venv/Scripts/python.exe -c \"import torch; print\\(''CUDA:'', torch.cuda.is_available\\(\\)\\); print\\(''GPU:'', torch.cuda.get_device_name\\(0\\) if torch.cuda.is_available\\(\\) else ''N/A''\\); print\\(''GPU count:'', torch.cuda.device_count\\(\\)\\); import os; print\\(''CPU cores:'', os.cpu_count\\(\\)\\); print\\(''torch threads:'', torch.get_num_threads\\(\\)\\); print\\(''torch interop threads:'', torch.get_num_interop_threads\\(\\)\\)\")",
       "Bash(cmd /c \"venv\\\\Scripts\\\\python.exe -c \"\"import torch, os; print\\(''CUDA:'', torch.cuda.is_available\\(\\)\\); print\\(''GPU:'', torch.cuda.get_device_name\\(0\\) if torch.cuda.is_available\\(\\) else ''N/A''\\); print\\(''GPU count:'', torch.cuda.device_count\\(\\)\\); print\\(''CPU cores:'', os.cpu_count\\(\\)\\); print\\(''torch threads:'', torch.get_num_threads\\(\\)\\); print\\(''torch interop threads:'', torch.get_num_interop_threads\\(\\)\\)\"\"\")",
       "Bash(find c:/_Dev/parakeet-diarized -type d -not -path */venv/* -not -path */__pycache__/*)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(curl -s http://localhost:8000/health)",
+      "Bash(python -m json.tool)",
+      "Bash(curl -s --max-time 5 http://localhost:8000/health)",
+      "Bash(python benchmark.py --dir experiments/ --url http://localhost:8000)",
+      "Bash(python benchmark.py --dir experiments/ --no-diarize)",
+      "Bash(python benchmark.py --dir experiments/ --concurrent 3)",
+      "Bash(python -c \"from dotenv import load_dotenv; load_dotenv\\(\\); import os; val=os.environ.get\\(''TORCH_COMPILE'',''NOT SET''\\); print\\(f''TORCH_COMPILE={repr\\(val\\)}''\\)\")",
+      "Bash(xxd \"c:\\\\_Dev\\\\parakeet-diarized\\\\.env\")",
+      "Bash(python -c \"import sys,json; h=json.load\\(sys.stdin\\); print\\(f\"\"torch_compile={h.get\\(''''torch_compile_enabled''''\\)}, batch_size={h[''''config''''][''''batch_size'''']}\"\"\\)\")",
+      "Bash(python -c \"import sys,json; h=json.load\\(sys.stdin\\); print\\(json.dumps\\(h[''''config''''], indent=2\\)\\)\")",
+      "Bash(python benchmark.py --file experiments/meeting.m4a --no-diarize --repeat 2)",
+      "Bash(python -c \"import sys,json; h=json.load\\(sys.stdin\\); print\\(f\"\"torch_compile={h.get\\(''''torch_compile_enabled''''\\)}, batch_size={h[''''config''''][''''batch_size'''']}, diarizer={h.get\\(''''diarizer_loaded''''\\)}\"\"\\)\")",
+      "Bash(python benchmark.py --file experiments/test.wav)",
+      "Bash(python benchmark.py --dir experiments/)",
+      "Bash(python benchmark.py --file experiments/meeting.m4a --repeat 2)",
+      "Bash(python -c \"import sys,json; h=json.load\\(sys.stdin\\); print\\(f\"\"torch_compile={h.get\\(''''torch_compile_enabled''''\\)}, mode={h[''''config''''].get\\(''''torch_compile_mode''''\\)}, batch_size={h[''''config''''][''''batch_size'''']}\"\"\\)\")",
+      "Bash(ls -la /mnt/c/_Dev/parakeet-diarized/venv/lib/python*/site-packages/)",
+      "Bash(ls -la /mnt/c/_Dev/parakeet-diarized/venv/lib/python*/site-packages/pyannote/audio/)",
+      "Bash(xargs grep:*)",
+      "Bash(find /c/_Dev/parakeet-diarized/venv/Lib/site-packages/nemo/collections/asr -name *.py -type f -exec grep -l \"ASRTranscriptionMixin\\\\|class.*Transcription\" {})",
+      "Bash(2)",
+      "Bash(grep -r 'class ASRTranscriptionMixin' /c/_Dev/parakeet-diarized/venv/Lib/site-packages/nemo/collections/asr --include=*.py)",
+      "Bash(grep -r \"memory_reserved\\\\|memory_allocated\\\\|empty_cache\\\\|cuda.empty_cache\" /c/_Dev/parakeet-diarized/venv/Lib/site-packages/pyannote --include=*.py)",
+      "Bash(grep -r \"memory_reserved\\\\|memory_allocated\\\\|empty_cache\\\\|cuda.empty_cache\" /c/_Dev/parakeet-diarized/venv/Lib/site-packages/nemo --include=*.py)"
     ]
   }
 }

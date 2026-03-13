@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import os
 import logging
 import tempfile
+import time
 import numpy as np
 import torch
 from pydantic import BaseModel
@@ -56,6 +57,29 @@ class Diarizer:
             self.pipeline.to(torch.device(self.device))
             logger.info(f"Diarization pipeline initialized on {self.device}")
 
+            # Apply GPU batch sizes — pyannote defaults both to 1, which severely
+            # underutilizes the GPU. These are property setters on SpeakerDiarization.
+            from config import get_config
+            cfg = get_config()
+            self.pipeline.segmentation_batch_size = cfg.diarize_segmentation_batch_size
+            self.pipeline.embedding_batch_size = cfg.diarize_embedding_batch_size
+
+            # Override segmentation step if configured (default 0.1 = 90% overlap).
+            # Higher step = fewer windows = fewer embeddings = faster diarization.
+            # Must update both pipeline attribute AND the Inference object's step.
+            if cfg.diarize_segmentation_step != 0.1:
+                seg_duration = self.pipeline._segmentation.duration
+                self.pipeline.segmentation_step = cfg.diarize_segmentation_step
+                self.pipeline._segmentation.step = cfg.diarize_segmentation_step * seg_duration
+                logger.info(f"Segmentation step overridden: {cfg.diarize_segmentation_step} "
+                            f"(window={seg_duration:.1f}s, step={self.pipeline._segmentation.step:.1f}s)")
+
+            logger.info(
+                f"Diarization config: seg_batch={cfg.diarize_segmentation_batch_size}, "
+                f"emb_batch={cfg.diarize_embedding_batch_size}, "
+                f"seg_step={cfg.diarize_segmentation_step}"
+            )
+
         except ImportError:
             logger.error("Failed to import pyannote.audio. Please install it with 'pip install pyannote.audio'")
         except Exception as e:
@@ -77,11 +101,53 @@ class Diarizer:
             return DiarizationResult(segments=[], num_speakers=0)
 
         try:
-            # Run the diarization pipeline
+            # Timing hook — logs elapsed time for each diarization stage.
+            # pyannote calls the hook multiple times per stage (progress callbacks),
+            # so we only record time when the stage NAME changes.
+            stage_times = {}
+            current_stage = {"name": None, "start": None}
+
+            def _timing_hook(step_name, step_artefact, **kwargs):
+                now = time.perf_counter()
+                if current_stage["name"] != step_name:
+                    # Stage changed — record elapsed time for previous stage
+                    if current_stage["name"] is not None:
+                        stage_times[current_stage["name"]] = now - current_stage["start"]
+                    current_stage["name"] = step_name
+                    current_stage["start"] = now
+                completed = kwargs.get("completed")
+                total = kwargs.get("total")
+                if completed is not None and total is not None:
+                    if completed == 1 or completed == total or completed % 50 == 0:
+                        logger.debug(f"Diarization [{step_name}]: {completed}/{total}")
+
+            # Log GPU memory before diarization
+            if torch.cuda.is_available():
+                mem_before = torch.cuda.memory_allocated() / 1024 / 1024
+                logger.info(f"GPU memory before diarize: {mem_before:.1f} MB")
+
+            # Run the diarization pipeline with timing hook
+            t_start = time.perf_counter()
             diarization = self.pipeline(
                 audio_path,
-                num_speakers=num_speakers
+                num_speakers=num_speakers,
+                hook=_timing_hook
             )
+            t_total = time.perf_counter() - t_start
+
+            # Close out the last stage
+            if current_stage["name"] is not None:
+                stage_times[current_stage["name"]] = t_total - sum(stage_times.values())
+
+            # Log per-stage breakdown
+            stage_str = " ".join(f"{k}={v:.2f}s" for k, v in stage_times.items())
+            logger.info(f"Diarization completed in {t_total:.2f}s — {stage_str}")
+
+            # Log GPU memory after diarization
+            if torch.cuda.is_available():
+                mem_after = torch.cuda.memory_allocated() / 1024 / 1024
+                mem_peak = torch.cuda.max_memory_allocated() / 1024 / 1024
+                logger.info(f"GPU memory after diarize: {mem_after:.1f} MB (peak {mem_peak:.1f} MB)")
 
             # Convert to our format
             segments = []

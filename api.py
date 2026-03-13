@@ -1,6 +1,7 @@
 import asyncio
 import os
 import logging
+import time
 from functools import partial
 from typing import List, Optional, Dict, Any, Union
 from pathlib import Path
@@ -14,15 +15,18 @@ from models import WhisperSegment, TranscriptionResponse, ModelInfo, ModelList
 from audio import convert_audio_to_wav, split_audio_into_chunks_async
 from transcription import load_model, format_srt, format_vtt, transcribe_audio_batch
 from diarization import Diarizer
+from batching import BatchingEngine
 from config import get_config
 
 # Initialize logging
 logger = logging.getLogger(__name__)
 
-# Global model and per-operation GPU semaphores
+# Global model, diarizer singleton, and per-operation GPU semaphores
 # transcribe_semaphore: serializes model.transcribe() calls (NeMo not thread-safe)
 # diarize_semaphore: serializes pyannote diarization (runs concurrently with transcription)
 asr_model = None
+diarizer_instance: Optional[Diarizer] = None
+batching_engine: Optional[BatchingEngine] = None
 transcribe_semaphore: asyncio.Semaphore = None
 diarize_semaphore: asyncio.Semaphore = None
 
@@ -50,7 +54,7 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     async def startup_event():
         """Initialize resources during startup"""
-        global asr_model, transcribe_semaphore, diarize_semaphore
+        global asr_model, diarizer_instance, batching_engine, transcribe_semaphore, diarize_semaphore
 
         transcribe_semaphore = asyncio.Semaphore(config.max_concurrent_requests)
         diarize_semaphore = asyncio.Semaphore(config.max_concurrent_diarize)
@@ -71,16 +75,52 @@ def create_app() -> FastAPI:
             asr_model = load_model(model_id)
             logger.info(f"Model {model_id} loaded successfully")
 
-            # Initialize diarization if token is available
+            # Initialize diarizer singleton if token is available
             hf_token = config.get_hf_token()
             if hf_token:
-                logger.info("HuggingFace access token found, speaker diarization will be available")
+                logger.info("Initializing diarizer singleton (pyannote pipeline)...")
+                diarizer_instance = Diarizer(access_token=hf_token)
+                logger.info("Diarizer singleton initialized — pipeline loaded once, reused across requests")
             else:
                 logger.info("No HuggingFace access token, speaker diarization will be disabled")
+
+            # Initialize cross-request batching engine if enabled
+            if config.enable_batch_queue and asr_model:
+                batching_engine = BatchingEngine(
+                    model=asr_model,
+                    batch_size=config.batch_size,
+                    max_wait=config.batch_queue_max_wait,
+                )
+                await batching_engine.start()
+                logger.info("Cross-request batch queue enabled")
 
         except Exception as e:
             logger.error(f"Error during startup: {str(e)}")
             # We don't want to fail startup completely, as the health endpoint should still work
+
+    @app.on_event("shutdown")
+    async def shutdown_event():
+        """Clean up resources during shutdown"""
+        global batching_engine
+        logger.info("Shutting down — cleaning up resources")
+        # Stop batching engine
+        if batching_engine:
+            await batching_engine.stop()
+            batching_engine = None
+        # Clean up temp directory
+        temp_dir = Path(config.temp_dir)
+        if temp_dir.exists():
+            for f in temp_dir.iterdir():
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+        # Release GPU memory
+        if torch.cuda.is_available():
+            gpu_mb = torch.cuda.memory_allocated() / 1024 / 1024
+            logger.info(f"GPU memory at shutdown: {gpu_mb:.1f} MB")
+            torch.cuda.empty_cache()
+        logger.info("Shutdown complete")
 
     @app.post("/v1/audio/transcriptions")
     async def transcribe_audio(
@@ -103,7 +143,7 @@ def create_app() -> FastAPI:
         This endpoint is compatible with the OpenAI Whisper API
         """
 
-        global asr_model, transcribe_semaphore, diarize_semaphore
+        global asr_model, diarizer_instance, transcribe_semaphore, diarize_semaphore
 
         if not asr_model:
             raise HTTPException(status_code=503, detail="Model not loaded yet. Please try again in a few moments.")
@@ -111,8 +151,15 @@ def create_app() -> FastAPI:
         # Process parameters
         logger.info(f"Transcription requested: {file.filename}, format: {response_format}")
 
+        t_request = time.perf_counter()
+        temp_file = None
+        wav_file = None
+        audio_chunks = []
+        diarize_task = None
+
         try:
             # --- Phase 1: File I/O (no GPU semaphore — runs concurrently with other requests) ---
+            t_phase1 = time.perf_counter()
 
             # Save uploaded file to temp location
             temp_dir = Path(config.temp_dir)
@@ -127,23 +174,23 @@ def create_app() -> FastAPI:
             loop = asyncio.get_event_loop()
 
             # Convert to WAV in a thread (blocking subprocess)
+            t_wav = time.perf_counter()
             wav_file = await loop.run_in_executor(None, convert_audio_to_wav, str(temp_file))
+            t_wav_done = time.perf_counter()
 
             # Split into chunks in parallel (async subprocesses)
             audio_chunks = await split_audio_into_chunks_async(wav_file, chunk_duration=chunk_duration)
+            t_phase1_done = time.perf_counter()
 
-            # Initialize diarization if requested
-            diarizer = None
-            if diarize:
-                hf_token = config.get_hf_token()
-                if hf_token:
-                    diarizer = Diarizer(access_token=hf_token)
-                else:
-                    logger.warning("Diarization requested but no HuggingFace token available")
+            # Use diarizer singleton (initialized once at startup)
+            diarizer = diarizer_instance if diarize else None
+            if diarize and not diarizer:
+                logger.warning("Diarization requested but diarizer not initialized (no HuggingFace token)")
 
             # --- Phase 2: GPU work (diarization and transcription run concurrently) ---
             # diarize_semaphore and transcribe_semaphore are independent — both can run at
             # the same time on the RTX 4090 (pyannote ~2-4GB, NeMo fp16 ~1.5GB + batch).
+            t_phase2 = time.perf_counter()
             diarization_result = None
             batch_results = []
 
@@ -159,26 +206,57 @@ def create_app() -> FastAPI:
             # Start diarization as a background task (if requested)
             diarize_task = asyncio.create_task(_run_diarize()) if diarizer else None
 
-            # Run transcription under its own semaphore (concurrent with diarization)
+            # Run transcription — either via batch queue (cross-request) or direct semaphore
             logger.info(f"Batch transcribing {len(audio_chunks)} chunk(s) with batch_size={config.batch_size}")
-            async with transcribe_semaphore:
-                batch_results = await loop.run_in_executor(
-                    None,
-                    partial(
-                        transcribe_audio_batch,
-                        asr_model,
-                        audio_chunks,
-                        config.batch_size,
-                        language,
-                        word_timestamps
+            t_transcribe = time.perf_counter()
+
+            if batching_engine:
+                # Cross-request batching: chunks are queued and merged with other requests
+                request_id = os.urandom(4).hex()
+                try:
+                    batch_results = await asyncio.wait_for(
+                        batching_engine.submit_chunks(
+                            audio_chunks, request_id,
+                            batch_size=config.batch_size,
+                            language=language,
+                            word_timestamps=word_timestamps,
+                        ),
+                        timeout=config.request_timeout
                     )
-                )
+                except asyncio.TimeoutError:
+                    raise HTTPException(status_code=504, detail=f"Transcription timed out after {config.request_timeout}s")
+            else:
+                # Direct path: semaphore-guarded single-request transcription
+                async with transcribe_semaphore:
+                    try:
+                        batch_results = await asyncio.wait_for(
+                            loop.run_in_executor(
+                                None,
+                                partial(
+                                    transcribe_audio_batch,
+                                    asr_model,
+                                    audio_chunks,
+                                    config.batch_size,
+                                    language,
+                                    word_timestamps
+                                )
+                            ),
+                            timeout=config.request_timeout
+                        )
+                    except asyncio.TimeoutError:
+                        raise HTTPException(status_code=504, detail=f"Transcription timed out after {config.request_timeout}s")
+            t_transcribe_done = time.perf_counter()
 
             # Wait for diarization to finish (usually already done by now)
+            t_diarize_elapsed = 0.0
             if diarize_task:
+                t_diarize_wait = time.perf_counter()
                 diarization_result = await diarize_task
+                t_diarize_elapsed = time.perf_counter() - t_diarize_wait
+            t_phase2_done = time.perf_counter()
 
             # --- Phase 3: Assemble results (no GPU) ---
+            t_phase3 = time.perf_counter()
             all_text = []
             all_segments = []
 
@@ -258,15 +336,21 @@ def create_app() -> FastAPI:
                 duration=sum(len(segment.text.split()) for segment in all_segments) / 150 if all_segments else 0,
                 model="parakeet-tdt-0.6b-v2"
             )
+            t_phase3_done = time.perf_counter()
 
-            # Clean up temporary files
-            if os.path.exists(temp_file):
-                os.unlink(temp_file)
-            if wav_file != str(temp_file) and os.path.exists(wav_file):
-                os.unlink(wav_file)
-            for chunk in audio_chunks:
-                if chunk != wav_file and os.path.exists(chunk):
-                    os.unlink(chunk)
+            # Log timing summary
+            audio_dur = len(audio_chunks) * chunk_duration if audio_chunks else 0
+            total_time = t_phase3_done - t_request
+            rtf = total_time / audio_dur if audio_dur > 0 else 0
+            logger.info(
+                f"timing: phase1={t_phase1_done - t_phase1:.2f}s"
+                f"(wav={t_wav_done - t_wav:.2f}s chunks={t_phase1_done - t_wav_done:.2f}s) "
+                f"phase2={t_phase2_done - t_phase2:.2f}s"
+                f"(transcribe={t_transcribe_done - t_transcribe:.2f}s diarize_wait={t_diarize_elapsed:.2f}s) "
+                f"phase3={t_phase3_done - t_phase3:.2f}s "
+                f"total={total_time:.2f}s chunks={len(audio_chunks)} "
+                f"audio~{audio_dur}s rtf={rtf:.4f}"
+            )
 
             # Return in requested format
             if response_format == "json":
@@ -282,24 +366,58 @@ def create_app() -> FastAPI:
             else:
                 raise HTTPException(status_code=400, detail=f"Unsupported response format: {response_format}")
 
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Error during transcription: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            # Wait for diarization to finish before deleting files it may be reading
+            if diarize_task and not diarize_task.done():
+                try:
+                    diarize_task.cancel()
+                    await diarize_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            # Clean up temporary files (runs even on error)
+            for path in [temp_file, wav_file]:
+                if path and os.path.exists(path):
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+            for chunk in audio_chunks:
+                if chunk and chunk != str(wav_file) and os.path.exists(chunk):
+                    try:
+                        os.unlink(chunk)
+                    except OSError:
+                        pass
 
     @app.get("/health")
     async def health_check():
         """
         Check the health of the API and the loaded model
         """
-        global asr_model
+        global asr_model, diarizer_instance
+
+        gpu_stats = {}
+        if torch.cuda.is_available():
+            gpu_stats = {
+                "gpu_memory_allocated_mb": round(torch.cuda.memory_allocated() / 1024 / 1024, 1),
+                "gpu_memory_reserved_mb": round(torch.cuda.memory_reserved() / 1024 / 1024, 1),
+                "gpu_max_memory_mb": round(torch.cuda.max_memory_allocated() / 1024 / 1024, 1),
+            }
 
         return {
             "status": "ok",
             "version": "1.0.0",
             "model_loaded": asr_model is not None,
+            "diarizer_loaded": diarizer_instance is not None,
             "model_id": config.model_id,
             "cuda_available": torch.cuda.is_available(),
             "gpu_info": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+            "torch_compile_enabled": config.torch_compile,
+            **gpu_stats,
             "config": config.as_dict()
         }
 

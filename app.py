@@ -455,4 +455,4 @@ with gr.Blocks(title="Parakeet Transcriber") as demo:
 
 if __name__ == "__main__":
     demo.queue()  # required for generator streaming (live progress updates)
-    demo.launch(server_name="0.0.0.0", server_port=7860, inbrowser=True, theme=gr.themes.Soft())
+    demo.launch(server_name="0.0.0.0", server_port=8001, inbrowser=True, theme=gr.themes.Soft())
