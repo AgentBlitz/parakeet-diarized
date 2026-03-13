@@ -7,7 +7,7 @@ import gradio as gr
 import pandas as pd
 import requests
 
-API_URL = "http://localhost:8000/v1/audio/transcriptions"
+API_URL = os.environ.get("API_URL", "http://localhost:8000/v1/audio/transcriptions")
 
 
 # ---------------------------------------------------------------------------

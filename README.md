@@ -14,10 +14,176 @@ A simple FastAPI server that provides an OpenAI Whisper API-compatible endpoint 
 ## Requirements
 
 - NVIDIA GPU with CUDA support (recommended)
-- Python 3.8 or higher
 - HuggingFace account and access token (required for speaker diarization)
 
-## Installation
+---
+
+## Quick Start (Docker) — Recommended
+
+Docker is the easiest way to get up and running. Everything is pre-configured — no Python, CUDA, or ffmpeg installation required on your host machine.
+
+### Prerequisites
+
+#### 1. Install Docker Desktop
+
+Download and install [Docker Desktop for Windows](https://www.docker.com/products/docker-desktop/). During setup:
+- Enable the **WSL 2 backend** when prompted
+- After installation, open Docker Desktop and confirm it's running (whale icon in system tray)
+
+#### 2. Install NVIDIA Container Toolkit
+
+This lets Docker access your GPU. Open a **WSL terminal** (or Ubuntu from the Start menu) and run:
+
+```bash
+# Add the NVIDIA package repository
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+  | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+  | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+  | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+
+sudo apt-get update
+sudo apt-get install -y nvidia-container-toolkit
+```
+
+Then **restart Docker Desktop**.
+
+#### 3. Verify GPU access in Docker
+
+Run this to confirm Docker can see your GPU:
+
+```bash
+docker run --rm --gpus all nvidia/cuda:12.1.1-runtime-ubuntu22.04 nvidia-smi
+```
+
+You should see your GPU listed (e.g. "NVIDIA GeForce RTX 4090"). If this fails, check that:
+- Docker Desktop is running with the WSL 2 backend
+- Your NVIDIA drivers are up to date
+- You restarted Docker Desktop after installing the container toolkit
+
+#### 4. Set up HuggingFace (required for speaker diarization)
+
+1. Create a free account at [huggingface.co](https://huggingface.co/)
+2. Generate an access token at [HuggingFace Settings > Tokens](https://huggingface.co/settings/tokens)
+3. **Accept the model licenses** — you must visit **both** links below and click "Agree":
+   - [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)
+   - [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
+
+> **Important:** Without accepting both licenses, diarization will fail on startup even with a valid token. You'll see a `401` or `Access to model is restricted` error in the logs.
+
+### Setup
+
+#### 5. Clone the repository
+
+```bash
+git clone https://github.com/jfgonsalves/parakeet-diarized
+cd parakeet-diarized
+```
+
+#### 6. Create your `.env` file
+
+Create a file called `.env` in the project root with the following contents. Replace `hf_YourTokenHere` with your actual HuggingFace token:
+
+```env
+# Required
+HUGGINGFACE_ACCESS_TOKEN=hf_YourTokenHere
+
+# GPU settings (defaults work well for RTX 3090/4090)
+BATCH_SIZE=32
+CHUNK_DURATION=30
+MAX_CONCURRENT_REQUESTS=1
+MAX_CONCURRENT_DIARIZE=1
+
+# Diarization tuning (good defaults, no need to change)
+DIARIZE_SEGMENTATION_BATCH_SIZE=8
+DIARIZE_EMBEDDING_BATCH_SIZE=8
+DIARIZE_SEGMENTATION_STEP=0.3
+
+# Leave these as-is
+TORCH_COMPILE=false
+ENABLE_DIARIZATION=true
+INCLUDE_DIARIZATION_IN_TEXT=true
+REQUEST_TIMEOUT=300
+```
+
+#### 7. Build and start
+
+```bash
+docker compose up --build
+```
+
+**What to expect on first run:**
+
+| Stage | Time | What's happening |
+|-------|------|-----------------|
+| Docker build | 15-30 min | Downloading CUDA base image, compiling Python packages |
+| Model download | 2-3 min | Downloading Parakeet (~1.5GB) and pyannote (~500MB) models from HuggingFace |
+| Model loading | 1-2 min | Loading models into GPU memory |
+
+You'll see `API server ready.` followed by `Starting Gradio frontend on port 8001...` when everything is loaded.
+
+**Subsequent starts** are much faster — the Docker image is cached and models are stored in Docker volumes.
+
+#### 8. Use it
+
+| Service | URL |
+|---------|-----|
+| **Gradio UI** (upload & transcribe) | http://localhost:8001 |
+| **API server** | http://localhost:8000 |
+| **Health check** | http://localhost:8000/health |
+| **API docs** (Swagger) | http://localhost:8000/docs |
+
+**Test with curl:**
+```bash
+curl -X POST http://localhost:8000/v1/audio/transcriptions \
+  -F file=@/path/to/your/audio.m4a \
+  -F model=whisper-1 \
+  -F timestamps=true \
+  -F diarize=true
+```
+
+Or just open http://localhost:8001 in your browser for the Gradio UI.
+
+### Docker Commands Reference
+
+```bash
+# Start (foreground — see logs in terminal)
+docker compose up
+
+# Start (background — runs silently)
+docker compose up -d
+
+# View logs when running in background
+docker compose logs -f
+
+# Stop
+docker compose down
+
+# Rebuild after code changes
+docker compose up --build
+
+# Full reset (removes cached models — will re-download on next start)
+docker compose down -v
+```
+
+### Troubleshooting
+
+| Problem | Solution |
+|---------|----------|
+| `nvidia-smi` not found in container | Install NVIDIA Container Toolkit (step 2) and restart Docker Desktop |
+| `401 Unauthorized` during model download | Check your `HUGGINGFACE_ACCESS_TOKEN` in `.env` |
+| `Access to model is restricted` | Accept **both** pyannote model licenses on HuggingFace (step 4) |
+| Build fails on `pip install torch` | Ensure Docker has internet access; try `docker compose build --no-cache` |
+| Out of GPU memory | Reduce `BATCH_SIZE` to 16 or 8 in `.env` |
+| Container exits immediately | Run `docker compose logs` to see the error |
+| Gradio UI not loading | Wait for `API server ready.` in logs — models take a few minutes to load |
+
+---
+
+## Manual Installation (without Docker)
+
+If you prefer to run without Docker (e.g. directly in WSL):
 
 1. Clone this repository:
    ```bash
