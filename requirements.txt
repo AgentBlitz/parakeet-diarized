@@ -27,3 +27,4 @@ ffmpeg-python
 soundfile
 cuda-python
 gradio>=4.0
+httpx

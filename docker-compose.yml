@@ -1,4 +1,28 @@
 services:
+  ollama:
+    image: ollama/ollama
+    container_name: parakeet-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:11434/api/tags"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
   parakeet:
     build:
       context: .
@@ -12,9 +36,14 @@ services:
     environment:
       - TEMP_DIR=/tmp/parakeet
       - NVIDIA_VISIBLE_DEVICES=all
+      - LLM_BASE_URL=http://ollama:11434
+      - LLM_MODEL=granite3.3:8b
     volumes:
       - huggingface-cache:/root/.cache/huggingface
       - torch-cache:/root/.cache/torch
+    depends_on:
+      ollama:
+        condition: service_healthy
     deploy:
       resources:
         reservations:
@@ -33,3 +62,4 @@ services:
 volumes:
   huggingface-cache:
   torch-cache:
+  ollama-models:

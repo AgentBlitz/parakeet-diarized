@@ -97,6 +97,13 @@ class Config:
         self.enable_batch_queue = os.environ.get("ENABLE_BATCH_QUEUE", "false").strip().lower() == "true"
         self.batch_queue_max_wait = float(os.environ.get("BATCH_QUEUE_MAX_WAIT", "0.5").strip())
 
+        # LLM settings (Ollama sidecar)
+        self.llm_enabled = os.environ.get("LLM_ENABLED", "true").strip().lower() == "true"
+        self.llm_base_url = os.environ.get("LLM_BASE_URL", "http://localhost:11434").strip()
+        self.llm_model = os.environ.get("LLM_MODEL", "granite3.3:8b").strip()
+        self.llm_timeout = float(os.environ.get("LLM_TIMEOUT", "120").strip())
+        self.llm_max_tokens = int(os.environ.get("LLM_MAX_TOKENS", "4096").strip())
+
         # File paths
         self.temp_dir = os.environ.get("TEMP_DIR", "/tmp/parakeet")
         Path(self.temp_dir).mkdir(parents=True, exist_ok=True)
@@ -134,6 +141,9 @@ class Config:
             "torch_compile_mode": self.torch_compile_mode,
             "request_timeout": self.request_timeout,
             "enable_batch_queue": self.enable_batch_queue,
+            "llm_enabled": self.llm_enabled,
+            "llm_model": self.llm_model,
+            "llm_base_url": self.llm_base_url,
         }
 
 

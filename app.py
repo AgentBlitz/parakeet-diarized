@@ -8,6 +8,7 @@ import pandas as pd
 import requests
 
 API_URL = os.environ.get("API_URL", "http://localhost:8000/v1/audio/transcriptions")
+ANALYZE_URL = os.environ.get("ANALYZE_URL", "http://localhost:8000/v1/meeting/analyze")
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +189,139 @@ def export_markdown(segments: list, speaker_df: pd.DataFrame):
 
 
 # ---------------------------------------------------------------------------
+# Meeting intelligence functions
+# ---------------------------------------------------------------------------
+
+def _format_intelligence_markdown(intel: dict) -> str:
+    """Format MeetingIntelligence dict as readable markdown."""
+    sections = []
+
+    if intel.get("summary"):
+        sections.append(f"## Summary\n{intel['summary']}")
+
+    if intel.get("action_items"):
+        items = "\n".join(
+            f"- **{a['assignee']}**: {a['task']}"
+            + (f" *(by {a['deadline']})*" if a.get("deadline") else "")
+            for a in intel["action_items"]
+        )
+        sections.append(f"## Action Items\n{items}")
+
+    if intel.get("decisions"):
+        items = "\n".join(
+            f"- **{d['decision']}** -- {d['context']}"
+            for d in intel["decisions"]
+        )
+        sections.append(f"## Decisions\n{items}")
+
+    if intel.get("unresolved_questions"):
+        items = "\n".join(
+            f"- {q['question']}"
+            + (f" *(raised by {q['raised_by']})*" if q.get("raised_by") else "")
+            for q in intel["unresolved_questions"]
+        )
+        sections.append(f"## Unresolved Questions\n{items}")
+
+    if intel.get("key_topics"):
+        items = "\n".join(f"- {t}" for t in intel["key_topics"])
+        sections.append(f"## Key Topics\n{items}")
+
+    if intel.get("participants"):
+        items = "\n".join(
+            f"- **{p['speaker_label']}**"
+            + (f" -- {p['role']}" if p.get("role") else "")
+            for p in intel["participants"]
+        )
+        sections.append(f"## Participants\n{items}")
+
+    if intel.get("follow_ups"):
+        items = "\n".join(
+            f"- {f['item']}"
+            + (f" *(owner: {f['owner']})*" if f.get("owner") else "")
+            for f in intel["follow_ups"]
+        )
+        sections.append(f"## Follow-ups\n{items}")
+
+    if intel.get("risks_and_blockers"):
+        items = "\n".join(
+            f"- {r['description']}"
+            + (f" *(raised by {r['raised_by']})*" if r.get("raised_by") else "")
+            for r in intel["risks_and_blockers"]
+        )
+        sections.append(f"## Risks & Blockers\n{items}")
+
+    if intel.get("generation_time_seconds"):
+        sections.append(
+            f"---\n*Analysis generated in {intel['generation_time_seconds']}s "
+            f"by {intel.get('model', 'LLM')}*"
+        )
+
+    return "\n\n".join(sections) if sections else "No intelligence extracted."
+
+
+def analyze_meeting(segments, speaker_df):
+    """Call the meeting analysis endpoint with the current transcript.
+
+    Yields: (status_md, intelligence_md, export_full_btn_visibility)
+    """
+    if not segments:
+        return "No transcript to analyze.", "", gr.update()
+
+    name_map = _build_name_map(speaker_df)
+    groups = _group_segments(segments, name_map)
+    transcript = "\n".join(f"{g['name']}: {g['text']}" for g in groups)
+
+    yield "Analyzing meeting... this may take 1-3 minutes for long transcripts.", "", gr.update()
+
+    try:
+        resp = requests.post(
+            ANALYZE_URL,
+            json={"transcript": transcript},
+            timeout=600,
+        )
+        resp.raise_for_status()
+        intelligence = resp.json()
+    except requests.exceptions.ConnectionError:
+        yield "Could not reach the server for analysis. Is the API running?", "", gr.update()
+        return
+    except requests.exceptions.Timeout:
+        yield "Analysis timed out. The transcript may be too long.", "", gr.update()
+        return
+    except requests.exceptions.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.response.json().get("detail", "")
+        except Exception:
+            pass
+        yield f"Analysis failed: {detail or e}", "", gr.update()
+        return
+    except Exception as e:
+        yield f"Analysis error: {e}", "", gr.update()
+        return
+
+    md = "---\n\n# Meeting Intelligence\n\n" + _format_intelligence_markdown(intelligence)
+    yield "Analysis complete.", md, gr.update(visible=True)
+
+
+def export_analysis_markdown(segments, speaker_df, intelligence_md):
+    """Export transcript + meeting intelligence as a single markdown file."""
+    transcript_md = build_markdown(segments, speaker_df)
+    if not transcript_md and not intelligence_md:
+        return None
+
+    combined = transcript_md
+    if intelligence_md:
+        combined += "\n\n---\n\n# Meeting Intelligence\n\n" + intelligence_md
+
+    tmp = tempfile.NamedTemporaryFile(
+        suffix=".md", delete=False, mode="w", encoding="utf-8"
+    )
+    tmp.write(combined)
+    tmp.close()
+    return tmp.name
+
+
+# ---------------------------------------------------------------------------
 # Batch functions
 # ---------------------------------------------------------------------------
 
@@ -294,8 +428,39 @@ def _export_single_batch(results: list, selected_name: str):
     return None
 
 
+def analyze_batch(results: list):
+    """Analyze all batch transcripts sequentially via the LLM endpoint."""
+    if not results:
+        yield results, "No results to analyze."
+        return
+
+    empty_df = pd.DataFrame({"Detected Label": [], "Name": []})
+    total = len(results)
+
+    for idx, r in enumerate(results):
+        yield gr.update(), f"**Analyzing {idx + 1} of {total}:** {r['name']}"
+
+        groups = _group_segments(r["segments"], _build_name_map(empty_df))
+        transcript = "\n".join(f"{g['name']}: {g['text']}" for g in groups)
+
+        try:
+            resp = requests.post(
+                ANALYZE_URL,
+                json={"transcript": transcript},
+                timeout=300,
+            )
+            resp.raise_for_status()
+            r["intelligence"] = resp.json()
+        except Exception as e:
+            r["intelligence"] = None
+            yield gr.update(), f"**Analysis failed for {r['name']}:** {e}"
+
+    done = sum(1 for r in results if r.get("intelligence"))
+    yield results, f"**Analysis complete — {done} of {total} files analyzed.**"
+
+
 def export_batch_zip(results: list):
-    """Create a ZIP of per-file .md transcripts."""
+    """Create a ZIP of per-file .md transcripts (with analysis if available)."""
     if not results:
         return None
 
@@ -306,6 +471,9 @@ def export_batch_zip(results: list):
     with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as zf:
         for r in results:
             md = build_markdown(r["segments"], empty_df)
+            if r.get("intelligence"):
+                md += "\n\n---\n\n# Meeting Intelligence\n\n"
+                md += _format_intelligence_markdown(r["intelligence"])
             stem = os.path.splitext(r["name"])[0]
             zf.writestr(f"{stem}.md", md)
 
@@ -348,10 +516,22 @@ with gr.Blocks(title="Parakeet Transcriber") as demo:
                             column_count=(2, "fixed"),
                         )
                         preview_md = gr.Markdown(label="Transcript Preview")
-                        export_btn = gr.DownloadButton(
-                            "Export Markdown",
+                        with gr.Row():
+                            export_btn = gr.DownloadButton(
+                                "Export Markdown",
+                                variant="secondary",
+                                visible=True,
+                            )
+                            analyze_btn = gr.Button(
+                                "Analyze Meeting",
+                                variant="secondary",
+                                size="lg",
+                            )
+                        intelligence_md = gr.Markdown("")
+                        export_full_btn = gr.DownloadButton(
+                            "Export Transcript + Analysis",
                             variant="secondary",
-                            visible=True,
+                            visible=False,
                         )
 
             transcribe_btn.click(
@@ -368,6 +548,16 @@ with gr.Blocks(title="Parakeet Transcriber") as demo:
                 fn=export_markdown,
                 inputs=[segments_state, speaker_table],
                 outputs=[export_btn],
+            )
+            analyze_btn.click(
+                fn=analyze_meeting,
+                inputs=[segments_state, speaker_table],
+                outputs=[status_md, intelligence_md, export_full_btn],
+            )
+            export_full_btn.click(
+                fn=export_analysis_markdown,
+                inputs=[segments_state, speaker_table, intelligence_md],
+                outputs=[export_full_btn],
             )
 
         # ── Batch tab ─────────────────────────────────────────────────────
@@ -403,11 +593,18 @@ with gr.Blocks(title="Parakeet Transcriber") as demo:
             # Results panel — hidden until batch completes
             with gr.Group(visible=False) as batch_results_group:
                 gr.Markdown("---")
-                batch_file_select = gr.Dropdown(
-                    label="View transcript",
-                    choices=[],
-                    interactive=True,
-                )
+                with gr.Row():
+                    batch_file_select = gr.Dropdown(
+                        label="View transcript",
+                        choices=[],
+                        interactive=True,
+                    )
+                    batch_analyze_btn = gr.Button(
+                        "Analyze All",
+                        variant="secondary",
+                        size="lg",
+                    )
+                batch_analyze_status = gr.Markdown("")
                 batch_preview_md = gr.Markdown()
                 with gr.Row():
                     batch_download_one_btn = gr.DownloadButton(
@@ -450,6 +647,11 @@ with gr.Blocks(title="Parakeet Transcriber") as demo:
                 fn=export_batch_zip,
                 inputs=[batch_results_state],
                 outputs=[batch_export_btn],
+            )
+            batch_analyze_btn.click(
+                fn=analyze_batch,
+                inputs=[batch_results_state],
+                outputs=[batch_results_state, batch_analyze_status],
             )
 
 

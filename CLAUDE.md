@@ -1,6 +1,6 @@
 # Parakeet Diarized
 
-FastAPI server wrapping `nvidia/parakeet-tdt-0.6b-v2` (NeMo RNNT ASR) + pyannote speaker diarization. Exposes an OpenAI-compatible `/v1/audio/transcriptions` endpoint. Gradio frontend in `app.py`.
+FastAPI server wrapping `nvidia/parakeet-tdt-0.6b-v2` (NeMo RNNT ASR) + pyannote speaker diarization + LLM-powered meeting intelligence (IBM Granite 3.3 8B via Ollama). Exposes OpenAI-compatible `/v1/audio/transcriptions` and `/v1/meeting/analyze` endpoints. Gradio frontend in `app.py`.
 
 ---
 
@@ -9,19 +9,28 @@ FastAPI server wrapping `nvidia/parakeet-tdt-0.6b-v2` (NeMo RNNT ASR) + pyannote
 - **Runs in WSL** (Ubuntu), not Windows — all runtime paths are `/mnt/c/_Dev/parakeet-diarized`
 - Python venv: `./venv` — activate with `source venv/bin/activate`
 - GPU: NVIDIA RTX 4090 (24GB VRAM), CUDA available in WSL
+- **Ollama** installed natively in WSL (not Docker) — serves LLM on `http://localhost:11434`
 - Server: `http://localhost:8000` | Frontend: `http://localhost:7860`
+- **Note:** Dockerfile/docker-compose.yml exist but are not used day-to-day. The primary workflow is `start.ps1` → WSL → uvicorn directly.
 
 ---
 
 ## How to Run
 
-### Start API server
+### 1. Start Ollama (LLM server)
+```bash
+# In WSL — runs in background, serves Granite 3.3 8B on port 11434
+ollama serve &>/dev/null &
+```
+First-time setup: `sudo apt-get install -y zstd && curl -fsSL https://ollama.com/install.sh | sh && ollama pull granite3.3:8b`
+
+### 2. Start API server
 ```powershell
 .\start.ps1
 ```
 Kills any process on port 8000, activates venv, starts uvicorn with hot-reload.
 
-### Start Gradio frontend (separate terminal)
+### 3. Start Gradio frontend (separate terminal)
 ```bash
 wsl bash -c "cd /mnt/c/_Dev/parakeet-diarized && source venv/bin/activate && python app.py"
 ```
@@ -29,6 +38,7 @@ wsl bash -c "cd /mnt/c/_Dev/parakeet-diarized && source venv/bin/activate && pyt
 ### Health check (poll until model_loaded=true — takes 2-3 min)
 ```bash
 curl http://localhost:8000/health
+# llm_available: true confirms Ollama connection
 ```
 
 ### Test transcription
@@ -40,20 +50,29 @@ curl -X POST http://localhost:8000/v1/audio/transcriptions \
   -F diarize=true
 ```
 
+### Test meeting analysis
+```bash
+curl -X POST http://localhost:8000/v1/meeting/analyze \
+  -H "Content-Type: application/json" \
+  -d '{"transcript":"Speaker 1: Lets review the migration. Speaker 2: I will handle backups by Friday."}'
+```
+
 ---
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `api.py` | FastAPI app, 3-phase async request lifecycle, GPU semaphore, per-phase timing |
+| `api.py` | FastAPI app, 4-phase async request lifecycle, GPU semaphore, per-phase timing |
 | `transcription.py` | NeMo model load + `transcribe_audio_batch()` (bulk GPU processing) + optional `torch.compile()` |
 | `audio.py` | ffmpeg WAV conversion + async parallel chunk extraction |
 | `diarization/__init__.py` | pyannote.audio speaker diarization (singleton, loaded once at startup) |
+| `llm.py` | LLM client — async Ollama wrapper for meeting intelligence extraction |
+| `prompts.py` | System + user prompt templates for Granite 3.3 structured reasoning |
 | `batching.py` | Cross-request chunk batching engine (opt-in via `ENABLE_BATCH_QUEUE`) |
 | `config.py` | Singleton `Config`, reads all env vars |
-| `app.py` | Gradio frontend — single file + batch upload UI |
-| `models.py` | Pydantic models (`WhisperSegment`, `TranscriptionResponse`) |
+| `app.py` | Gradio frontend — single file + batch upload UI + meeting analysis |
+| `models.py` | Pydantic models (`WhisperSegment`, `TranscriptionResponse`, `MeetingIntelligence`) |
 | `benchmark.py` | API benchmark script — sequential or concurrent file testing |
 | `main.py` | uvicorn entrypoint |
 
@@ -87,6 +106,13 @@ BATCH_QUEUE_MAX_WAIT=0.5        # max seconds to wait before flushing an incompl
 # Reliability
 REQUEST_TIMEOUT=300             # seconds before 504 timeout (0 = no timeout)
 
+# LLM meeting intelligence (Ollama sidecar)
+LLM_ENABLED=true                # enable/disable LLM analysis feature
+LLM_BASE_URL=http://localhost:11434  # Ollama API (use http://ollama:11434 in Docker)
+LLM_MODEL=granite3.3:8b         # IBM Granite 3.3 8B Instruct (Q4_K_M, ~5GB VRAM)
+LLM_TIMEOUT=120                 # seconds before LLM request timeout
+LLM_MAX_TOKENS=4096             # max generation tokens for meeting analysis
+
 # Optional
 MODEL_ID=nvidia/parakeet-tdt-0.6b-v2
 TEMP_DIR=/tmp/parakeet
@@ -112,11 +138,23 @@ HTTP POST /v1/audio/transcriptions
 │   └── transcribe_semaphore: transcribe_audio_batch(all_chunks, batch_size=N)
 │               model.transcribe([chunk1, chunk2, ...], batch_size=N)
 │
-└── Phase 3 (no semaphore)
-    ├── Apply chunk time offsets to segments
-    ├── diarizer.merge_with_transcription()
-    ├── Prepend speaker labels to text (if enabled)
-    └── Return JSON / text / SRT / VTT
+├── Phase 3 (no semaphore)
+│   ├── Apply chunk time offsets to segments
+│   ├── diarizer.merge_with_transcription()
+│   └── Prepend speaker labels to text (if enabled)
+│
+└── Phase 4 (optional, when analyze=true — Ollama manages its own GPU)
+    ├── POST diarized transcript to Ollama /v1/chat/completions
+    ├── Granite 3.3 8B: <think> reasoning → <response> JSON extraction
+    ├── Parse MeetingIntelligence (summary, actions, decisions, questions...)
+    └── Return JSON with text + segments + meeting_intelligence
+```
+
+### Standalone analysis endpoint
+```
+POST /v1/meeting/analyze
+  Body: {"transcript": "Speaker 1: ..."}
+  Returns: MeetingIntelligence JSON
 ```
 
 ---

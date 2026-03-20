@@ -11,11 +11,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 import torch
 
-from models import WhisperSegment, TranscriptionResponse, ModelInfo, ModelList
+from models import (
+    WhisperSegment, TranscriptionResponse, ModelInfo, ModelList,
+    MeetingIntelligence, AnalyzeRequest,
+)
 from audio import convert_audio_to_wav, split_audio_into_chunks_async
 from transcription import load_model, format_srt, format_vtt, transcribe_audio_batch
 from diarization import Diarizer
 from batching import BatchingEngine
+from llm import LLMClient
 from config import get_config
 
 # Initialize logging
@@ -27,6 +31,7 @@ logger = logging.getLogger(__name__)
 asr_model = None
 diarizer_instance: Optional[Diarizer] = None
 batching_engine: Optional[BatchingEngine] = None
+llm_client: Optional[LLMClient] = None
 transcribe_semaphore: asyncio.Semaphore = None
 diarize_semaphore: asyncio.Semaphore = None
 
@@ -54,7 +59,7 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     async def startup_event():
         """Initialize resources during startup"""
-        global asr_model, diarizer_instance, batching_engine, transcribe_semaphore, diarize_semaphore
+        global asr_model, diarizer_instance, batching_engine, llm_client, transcribe_semaphore, diarize_semaphore
 
         transcribe_semaphore = asyncio.Semaphore(config.max_concurrent_requests)
         diarize_semaphore = asyncio.Semaphore(config.max_concurrent_diarize)
@@ -94,6 +99,18 @@ def create_app() -> FastAPI:
                 await batching_engine.start()
                 logger.info("Cross-request batch queue enabled")
 
+            # Initialize LLM client (Ollama sidecar) — non-fatal if unavailable
+            if config.llm_enabled:
+                try:
+                    llm_client = LLMClient()
+                    if await llm_client.is_available():
+                        await llm_client.ensure_model_pulled()
+                        logger.info(f"LLM client initialized — model={config.llm_model}")
+                    else:
+                        logger.warning("LLM service not reachable — meeting analysis will be unavailable")
+                except Exception as llm_err:
+                    logger.warning(f"LLM initialization failed ({llm_err}) — meeting analysis will be unavailable")
+
         except Exception as e:
             logger.error(f"Error during startup: {str(e)}")
             # We don't want to fail startup completely, as the health endpoint should still work
@@ -101,12 +118,16 @@ def create_app() -> FastAPI:
     @app.on_event("shutdown")
     async def shutdown_event():
         """Clean up resources during shutdown"""
-        global batching_engine
+        global batching_engine, llm_client
         logger.info("Shutting down — cleaning up resources")
         # Stop batching engine
         if batching_engine:
             await batching_engine.stop()
             batching_engine = None
+        # Close LLM client
+        if llm_client:
+            await llm_client.close()
+            llm_client = None
         # Clean up temp directory
         temp_dir = Path(config.temp_dir)
         if temp_dir.exists():
@@ -135,7 +156,8 @@ def create_app() -> FastAPI:
         vad_filter: bool = Form(False),
         word_timestamps: bool = Form(False),
         diarize: bool = Form(True),
-        include_diarization_in_text: Optional[bool] = Form(None)
+        include_diarization_in_text: Optional[bool] = Form(None),
+        analyze: bool = Form(False),
     ):
         """
         Transcribe audio file using the Parakeet-TDT model
@@ -143,7 +165,7 @@ def create_app() -> FastAPI:
         This endpoint is compatible with the OpenAI Whisper API
         """
 
-        global asr_model, diarizer_instance, transcribe_semaphore, diarize_semaphore
+        global asr_model, diarizer_instance, llm_client, transcribe_semaphore, diarize_semaphore
 
         if not asr_model:
             raise HTTPException(status_code=503, detail="Model not loaded yet. Please try again in a few moments.")
@@ -338,16 +360,34 @@ def create_app() -> FastAPI:
             )
             t_phase3_done = time.perf_counter()
 
+            # --- Phase 4: LLM meeting analysis (optional, no local GPU semaphore) ---
+            t_phase4 = time.perf_counter()
+            if analyze and llm_client:
+                try:
+                    if await llm_client.is_available():
+                        intelligence = await llm_client.analyze_transcript(full_text)
+                        response.meeting_intelligence = intelligence
+                        logger.info(f"Phase 4: LLM analysis attached ({intelligence.generation_time_seconds}s)")
+                    else:
+                        logger.warning("LLM requested but service unavailable — skipping analysis")
+                except Exception as llm_err:
+                    logger.error(f"LLM analysis failed: {llm_err}")
+            elif analyze and not llm_client:
+                logger.warning("analyze=true but LLM client not initialized")
+            t_phase4_done = time.perf_counter()
+
             # Log timing summary
             audio_dur = len(audio_chunks) * chunk_duration if audio_chunks else 0
-            total_time = t_phase3_done - t_request
+            total_time = t_phase4_done - t_request
             rtf = total_time / audio_dur if audio_dur > 0 else 0
+            phase4_str = f" phase4={t_phase4_done - t_phase4:.2f}s" if analyze else ""
             logger.info(
                 f"timing: phase1={t_phase1_done - t_phase1:.2f}s"
                 f"(wav={t_wav_done - t_wav:.2f}s chunks={t_phase1_done - t_wav_done:.2f}s) "
                 f"phase2={t_phase2_done - t_phase2:.2f}s"
                 f"(transcribe={t_transcribe_done - t_transcribe:.2f}s diarize_wait={t_diarize_elapsed:.2f}s) "
-                f"phase3={t_phase3_done - t_phase3:.2f}s "
+                f"phase3={t_phase3_done - t_phase3:.2f}s"
+                f"{phase4_str} "
                 f"total={total_time:.2f}s chunks={len(audio_chunks)} "
                 f"audio~{audio_dur}s rtf={rtf:.4f}"
             )
@@ -393,6 +433,38 @@ def create_app() -> FastAPI:
                     except OSError:
                         pass
 
+    @app.post("/v1/meeting/analyze")
+    async def analyze_meeting(request: AnalyzeRequest):
+        """
+        Analyze a diarized transcript and extract meeting intelligence.
+
+        Accepts a transcript string (with speaker labels) and returns structured
+        meeting intelligence: summary, action items, decisions, questions, etc.
+        """
+        if not llm_client:
+            raise HTTPException(
+                status_code=503,
+                detail="LLM service not configured. Set LLM_ENABLED=true and ensure Ollama is running."
+            )
+
+        if not await llm_client.is_available():
+            raise HTTPException(
+                status_code=503,
+                detail="LLM service is not reachable. Ensure Ollama is running."
+            )
+
+        if not request.transcript.strip():
+            raise HTTPException(status_code=400, detail="Transcript cannot be empty.")
+
+        try:
+            intelligence = await llm_client.analyze_transcript(
+                request.transcript, model=request.model
+            )
+            return intelligence.dict()
+        except Exception as e:
+            logger.error(f"Meeting analysis failed: {e}")
+            raise HTTPException(status_code=500, detail=f"LLM analysis failed: {e}")
+
     @app.get("/health")
     async def health_check():
         """
@@ -413,6 +485,8 @@ def create_app() -> FastAPI:
             "version": "1.0.0",
             "model_loaded": asr_model is not None,
             "diarizer_loaded": diarizer_instance is not None,
+            "llm_available": llm_client is not None,
+            "llm_model": config.llm_model if llm_client else None,
             "model_id": config.model_id,
             "cuda_available": torch.cuda.is_available(),
             "gpu_info": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
