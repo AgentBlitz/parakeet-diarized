@@ -6,9 +6,10 @@ from functools import partial
 from typing import List, Optional, Dict, Any, Union
 from pathlib import Path
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
+import numpy as np
 import torch
 
 from models import (
@@ -16,7 +17,7 @@ from models import (
     MeetingIntelligence, AnalyzeRequest,
 )
 from audio import convert_audio_to_wav, split_audio_into_chunks_async
-from transcription import load_model, format_srt, format_vtt, transcribe_audio_batch
+from transcription import load_model, format_srt, format_vtt, transcribe_audio_batch, transcribe_audio_numpy
 from diarization import Diarizer
 from batching import BatchingEngine
 from llm import LLMClient
@@ -432,6 +433,52 @@ def create_app() -> FastAPI:
                         os.unlink(chunk)
                     except OSError:
                         pass
+
+    @app.post("/transcribe")
+    async def transcribe_raw(request: Request):
+        """
+        Lightweight transcription endpoint for real-time audio streams.
+
+        Accepts raw Float32Array binary (16kHz mono) as application/octet-stream
+        and returns {"text": "..."}.  Designed for browser extensions that capture
+        audio at 16kHz mono and send short chunks (2-30s) in real time.
+
+        No diarization, no ffmpeg, no temp files — numpy straight to GPU.
+        """
+        global asr_model, transcribe_semaphore
+
+        if not asr_model:
+            raise HTTPException(status_code=503, detail="Model not loaded yet.")
+
+        raw = await request.body()
+        # 3200 bytes = 800 float32 samples = 0.05s at 16kHz — too short to transcribe
+        if len(raw) < 3200:
+            return JSONResponse({"text": ""})
+
+        audio = np.frombuffer(raw, dtype=np.float32)
+        duration = len(audio) / 16000
+        if duration > 45:
+            raise HTTPException(status_code=400, detail=f"Audio too long ({duration:.1f}s). Max ~40s per chunk.")
+
+        t_start = time.perf_counter()
+        loop = asyncio.get_event_loop()
+
+        async with transcribe_semaphore:
+            try:
+                text, segments = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None,
+                        partial(transcribe_audio_numpy, asr_model, audio)
+                    ),
+                    timeout=config.request_timeout
+                )
+            except asyncio.TimeoutError:
+                raise HTTPException(status_code=504, detail="Transcription timed out.")
+
+        t_elapsed = time.perf_counter() - t_start
+        logger.info(f"/transcribe: {duration:.1f}s audio → {len(text)} chars in {t_elapsed:.2f}s")
+
+        return JSONResponse({"text": text})
 
     @app.post("/v1/meeting/analyze")
     async def analyze_meeting(request: AnalyzeRequest):

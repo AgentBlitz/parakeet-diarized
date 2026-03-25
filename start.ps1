@@ -3,4 +3,4 @@
 
 $wslPath = "/mnt/c/_Dev/parakeet-diarized"
 
-wsl bash -c "fuser -k 8000/tcp 2>/dev/null; cd '$wslPath' && bash run.sh"
+wsl bash -c "pkill -f '[u]vicorn main:app' 2>/dev/null; cd '$wslPath' && bash run.sh"

@@ -1,6 +1,6 @@
 # Parakeet Diarized
 
-FastAPI server wrapping `nvidia/parakeet-tdt-0.6b-v2` (NeMo RNNT ASR) + pyannote speaker diarization + LLM-powered meeting intelligence (IBM Granite 3.3 8B via Ollama). Exposes OpenAI-compatible `/v1/audio/transcriptions` and `/v1/meeting/analyze` endpoints. Gradio frontend in `app.py`.
+FastAPI server wrapping `nvidia/parakeet-tdt-0.6b-v2` (NeMo RNNT ASR) + pyannote speaker diarization + LLM-powered meeting intelligence (IBM Granite 3.3 8B via Ollama). Exposes OpenAI-compatible `/v1/audio/transcriptions`, `/v1/meeting/analyze`, and a lightweight `/transcribe` endpoint for real-time browser extension streaming. Gradio frontend in `app.py`.
 
 ---
 
@@ -10,7 +10,7 @@ FastAPI server wrapping `nvidia/parakeet-tdt-0.6b-v2` (NeMo RNNT ASR) + pyannote
 - Python venv: `./venv` — activate with `source venv/bin/activate`
 - GPU: NVIDIA RTX 4090 (24GB VRAM), CUDA available in WSL
 - **Ollama** installed natively in WSL (not Docker) — serves LLM on `http://localhost:11434`
-- Server: `http://localhost:8000` | Frontend: `http://localhost:7860`
+- Server: `http://localhost:8000` | Frontend: `http://localhost:8001`
 - **Note:** Dockerfile/docker-compose.yml exist but are not used day-to-day. The primary workflow is `start.ps1` → WSL → uvicorn directly.
 
 ---
@@ -50,6 +50,21 @@ curl -X POST http://localhost:8000/v1/audio/transcriptions \
   -F diarize=true
 ```
 
+### Test real-time transcription (raw binary, for TransMeet extension)
+```bash
+# Generate a test float32 audio file from a WAV, then POST it:
+python -c "
+import numpy as np, scipy.io.wavfile as wav
+sr, data = wav.read('/path/to/test.wav')
+audio = data.astype(np.float32) / 32768.0
+audio.tofile('/tmp/test.raw')
+"
+curl -X POST http://localhost:8000/transcribe \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary @/tmp/test.raw
+# Returns: {"text": "transcribed text"}
+```
+
 ### Test meeting analysis
 ```bash
 curl -X POST http://localhost:8000/v1/meeting/analyze \
@@ -64,7 +79,7 @@ curl -X POST http://localhost:8000/v1/meeting/analyze \
 | File | Purpose |
 |------|---------|
 | `api.py` | FastAPI app, 4-phase async request lifecycle, GPU semaphore, per-phase timing |
-| `transcription.py` | NeMo model load + `transcribe_audio_batch()` (bulk GPU processing) + optional `torch.compile()` |
+| `transcription.py` | NeMo model load + `transcribe_audio_batch()` (bulk GPU) + `transcribe_audio_numpy()` (real-time numpy) + optional `torch.compile()` |
 | `audio.py` | ffmpeg WAV conversion + async parallel chunk extraction |
 | `diarization/__init__.py` | pyannote.audio speaker diarization (singleton, loaded once at startup) |
 | `llm.py` | LLM client — async Ollama wrapper for meeting intelligence extraction |
@@ -150,6 +165,20 @@ HTTP POST /v1/audio/transcriptions
     └── Return JSON with text + segments + meeting_intelligence
 ```
 
+### Real-time streaming endpoint (TransMeet browser extension)
+```
+HTTP POST /transcribe
+  Content-Type: application/octet-stream
+  Body: raw Float32Array (16kHz mono) — 2-30s chunks
+│
+├── np.frombuffer(body, dtype=float32)
+├── transcribe_semaphore
+├── model.transcribe(np_array)  →  run_in_executor (no ffmpeg, no temp files)
+└── Return {"text": "..."}
+```
+No diarization (speaker detection is done via DOM in the browser extension).
+No chunking (chunks are already ≤30s). No file I/O — numpy straight to GPU.
+
 ### Standalone analysis endpoint
 ```
 POST /v1/meeting/analyze
@@ -213,7 +242,7 @@ GPU memory drop during diarization is normal — PyTorch's caching allocator fre
 
 ## Gradio Frontend (`app.py`)
 
-Runs on port 7860. Two tabs:
+Runs on port 8001. Two tabs:
 
 - **Single File** — record or upload one file, view transcript with speaker rename + export
 - **Batch** — drop multiple audio files, process all sequentially, export ZIP of `.md` transcripts

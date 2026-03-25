@@ -273,6 +273,54 @@ def transcribe_audio_batch(
     return results
 
 
+def transcribe_audio_numpy(
+    model,
+    audio: np.ndarray,
+) -> Tuple[str, List[WhisperSegment]]:
+    """
+    Transcribe a raw numpy audio array (16kHz mono float32) directly on GPU.
+
+    Skips file I/O, ffmpeg, and chunking — designed for short real-time chunks
+    (2-30s) from browser extensions that already capture at 16kHz mono.
+
+    Args:
+        model: Loaded ASR model
+        audio: Float32 numpy array at 16kHz mono
+
+    Returns:
+        Tuple of (transcription text, list of WhisperSegment objects)
+    """
+    duration = len(audio) / 16000
+    logger.info(f"Transcribing numpy audio: {len(audio)} samples ({duration:.2f}s)")
+
+    t_start = time.perf_counter()
+    with torch.no_grad():
+        try:
+            transcriptions = model.transcribe(
+                audio, batch_size=1, return_hypotheses=True
+            )
+        except Exception as e:
+            logger.warning(f"Numpy transcription with return_hypotheses failed ({e}), retrying plain")
+            transcriptions = model.transcribe(audio, batch_size=1)
+    t_elapsed = time.perf_counter() - t_start
+    logger.info(f"Numpy transcribe took {t_elapsed:.2f}s for {duration:.1f}s audio")
+
+    if not transcriptions or len(transcriptions) == 0:
+        logger.warning("model.transcribe() returned empty result for numpy input")
+        return "", []
+
+    # NeMo 2.x may return (List[str], List[Hypothesis]) tuple
+    if (isinstance(transcriptions, (list, tuple))
+            and len(transcriptions) == 2
+            and isinstance(transcriptions[0], list)
+            and isinstance(transcriptions[1], list)):
+        transcriptions = transcriptions[1]
+
+    # Single input → single result
+    hyp = transcriptions[0] if isinstance(transcriptions, (list, tuple)) else transcriptions
+    return _parse_hypothesis(hyp, model)
+
+
 def transcribe_audio_chunk(model, audio_path: str, language: Optional[str] = None,
                            word_timestamps: bool = False) -> Tuple[str, List[WhisperSegment]]:
     """

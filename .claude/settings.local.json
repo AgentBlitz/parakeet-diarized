@@ -35,7 +35,8 @@
       "Bash(grep -r \"memory_reserved\\\\|memory_allocated\\\\|empty_cache\\\\|cuda.empty_cache\" /c/_Dev/parakeet-diarized/venv/Lib/site-packages/pyannote --include=*.py)",
       "Bash(grep -r \"memory_reserved\\\\|memory_allocated\\\\|empty_cache\\\\|cuda.empty_cache\" /c/_Dev/parakeet-diarized/venv/Lib/site-packages/nemo --include=*.py)",
       "Bash(curl -sf http://localhost:8000/health)",
-      "Bash(ls -la /mnt/c/_Dev/parakeet-diarized/*.py)"
+      "Bash(ls -la /mnt/c/_Dev/parakeet-diarized/*.py)",
+      "Bash(find c:/_Dev/parakeet-diarized/venv -path */nemo/collections/asr/models/* -name *.py)"
     ]
   }
 }
