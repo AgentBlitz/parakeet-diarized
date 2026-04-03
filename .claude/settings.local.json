@@ -33,7 +33,8 @@
       "Bash(2)",
       "Bash(grep -r 'class ASRTranscriptionMixin' /c/_Dev/parakeet-diarized/venv/Lib/site-packages/nemo/collections/asr --include=*.py)",
       "Bash(grep -r \"memory_reserved\\\\|memory_allocated\\\\|empty_cache\\\\|cuda.empty_cache\" /c/_Dev/parakeet-diarized/venv/Lib/site-packages/pyannote --include=*.py)",
-      "Bash(grep -r \"memory_reserved\\\\|memory_allocated\\\\|empty_cache\\\\|cuda.empty_cache\" /c/_Dev/parakeet-diarized/venv/Lib/site-packages/nemo --include=*.py)"
+      "Bash(grep -r \"memory_reserved\\\\|memory_allocated\\\\|empty_cache\\\\|cuda.empty_cache\" /c/_Dev/parakeet-diarized/venv/Lib/site-packages/nemo --include=*.py)",
+      "Bash(curl -v https://registry.ollama.ai/v2/library/qwen3.5/manifests/9b)"
     ]
   }
 }

@@ -10,6 +10,7 @@ Used by the MeetingFlow pipeline to identify entities before obfuscation.
 
 import json
 import logging
+import re
 import time
 from typing import Dict, List, Optional
 
@@ -82,15 +83,32 @@ async def extract_entities(
 
     content = data["choices"][0]["message"]["content"]
 
-    # Parse JSON from response — handle markdown code blocks
+    # Parse JSON from response — handle thinking tags, markdown code blocks,
+    # and extra text before/after JSON (common with reasoning models like Qwen3.5)
     content = content.strip()
+
+    # Strip <think>...</think> blocks
+    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+
     if content.startswith("```"):
         # Strip ```json ... ``` wrapper
         lines = content.split("\n")
         content = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
         content = content.strip()
 
-    entities = json.loads(content)
+    # Find the first valid JSON object in the response
+    entities = None
+    for match in re.finditer(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", content):
+        try:
+            candidate = json.loads(match.group())
+            if any(k in candidate for k in ("people", "projects", "organizations", "brands")):
+                entities = candidate
+                break
+        except json.JSONDecodeError:
+            continue
+
+    if entities is None:
+        raise ValueError(f"No valid entity JSON found in LLM response: {content[:200]}")
 
     # Normalize: ensure all expected keys exist with list values
     result = {
