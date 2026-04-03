@@ -4,8 +4,6 @@ import logging
 from typing import Dict, Optional, Any
 from pathlib import Path
 
-from pydantic.types import T
-
 # Set up logging
 logger = logging.getLogger(__name__)
 
@@ -97,16 +95,28 @@ class Config:
         self.enable_batch_queue = os.environ.get("ENABLE_BATCH_QUEUE", "false").strip().lower() == "true"
         self.batch_queue_max_wait = float(os.environ.get("BATCH_QUEUE_MAX_WAIT", "0.5").strip())
 
+        # Real-time transcription backpressure (/transcribe endpoint)
+        self.max_transcribe_queue = int(os.environ.get("MAX_TRANSCRIBE_QUEUE", "20").strip())
+        self.transcribe_timeout = float(os.environ.get("TRANSCRIBE_TIMEOUT", "30").strip())
+        if self.transcribe_timeout <= 0:
+            self.transcribe_timeout = None  # asyncio.wait_for treats None as no timeout
+
+        # File paths — must be set before job_db_path which depends on temp_dir
+        self.temp_dir = os.environ.get("TEMP_DIR", "/tmp/parakeet")
+        Path(self.temp_dir).mkdir(parents=True, exist_ok=True)
+
+        # Async job queue
+        self.enable_job_queue = os.environ.get("ENABLE_JOB_QUEUE", "false").strip().lower() == "true"
+        self.job_db_path = os.environ.get("JOB_DB_PATH", os.path.join(self.temp_dir, "parakeet_jobs.db")).strip()
+        self.job_retention_hours = int(os.environ.get("JOB_RETENTION_HOURS", "72").strip())
+        self.job_cleanup_interval = int(os.environ.get("JOB_CLEANUP_INTERVAL", "3600").strip())
+
         # LLM settings (Ollama sidecar)
         self.llm_enabled = os.environ.get("LLM_ENABLED", "true").strip().lower() == "true"
         self.llm_base_url = os.environ.get("LLM_BASE_URL", "http://localhost:11434").strip()
         self.llm_model = os.environ.get("LLM_MODEL", "granite3.3:8b").strip()
         self.llm_timeout = float(os.environ.get("LLM_TIMEOUT", "120").strip())
         self.llm_max_tokens = int(os.environ.get("LLM_MAX_TOKENS", "4096").strip())
-
-        # File paths
-        self.temp_dir = os.environ.get("TEMP_DIR", "/tmp/parakeet")
-        Path(self.temp_dir).mkdir(parents=True, exist_ok=True)
 
         logger.debug(f"Initialized configuration: debug={self.debug}, model={self.model_id}")
 
@@ -141,6 +151,10 @@ class Config:
             "torch_compile_mode": self.torch_compile_mode,
             "request_timeout": self.request_timeout,
             "enable_batch_queue": self.enable_batch_queue,
+            "max_transcribe_queue": self.max_transcribe_queue,
+            "transcribe_timeout": self.transcribe_timeout,
+            "enable_job_queue": self.enable_job_queue,
+            "job_retention_hours": self.job_retention_hours,
             "llm_enabled": self.llm_enabled,
             "llm_model": self.llm_model,
             "llm_base_url": self.llm_base_url,

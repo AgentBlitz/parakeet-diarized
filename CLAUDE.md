@@ -74,6 +74,41 @@ curl -X POST http://localhost:8000/v1/meeting/analyze \
 
 ---
 
+## Remote Access (LAN / other machines)
+
+WSL2 uses NAT networking — the server listens inside a VM that external machines can't reach directly. Two things are needed to expose it on the LAN:
+
+### One-time setup (elevated PowerShell)
+```powershell
+# Allow inbound TCP on port 8000 through Windows Firewall
+New-NetFirewallRule -DisplayName "Parakeet API (WSL2)" -Direction Inbound -Protocol TCP -LocalPort 8000 -Action Allow
+```
+
+### Per-boot: port proxy (handled automatically by `start.ps1`)
+WSL2's internal IP changes on every reboot. `start.ps1` automatically creates a port proxy (`netsh interface portproxy`) that forwards `0.0.0.0:8000` → WSL's current IP. This triggers a single UAC prompt.
+
+To verify the proxy is active:
+```powershell
+netsh interface portproxy show v4tov4
+```
+
+### On the remote machine
+Point the TransMeet extension (or any client) at the host machine's LAN IP:
+```
+http://<host-lan-ip>:8000/transcribe
+```
+Test with:
+```bash
+curl http://<host-lan-ip>:8000/health
+```
+
+### Troubleshooting
+- **Connection timeout**: Check that the firewall rule exists (`Get-NetFirewallRule -DisplayName "Parakeet API*"`) and the port proxy is set (`netsh interface portproxy show v4tov4`)
+- **Connection refused**: Server isn't running yet — wait for model load (~2-3 min), check `curl localhost:8000/health` on the host first
+- **UAC prompt not appearing**: `start.ps1` must be run from an interactive PowerShell session (not a background task)
+
+---
+
 ## Key Files
 
 | File | Purpose |

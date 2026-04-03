@@ -28,3 +28,4 @@ soundfile
 cuda-python
 gradio>=4.0
 httpx
+aiosqlite>=0.19.0

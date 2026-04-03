@@ -1,4 +1,4 @@
 # Parakeet one-click stopper
 # Kills the server process listening on port 8000
 
-wsl bash -c "pkill -f 'uvicorn main:app' && echo 'Parakeet stopped.' || echo 'Nothing was running on port 8000.'"
+wsl bash /mnt/c/_Dev/parakeet-diarized/stop.sh
