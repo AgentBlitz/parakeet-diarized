@@ -15,11 +15,17 @@ FastAPI server wrapping `nvidia/parakeet-tdt-0.6b-v2` (NeMo RNNT ASR) + pyannote
 
 ## How to Run
 
-### Start API server
+### Start API server (includes LLM server)
 ```powershell
 .\start.ps1
 ```
-Kills any process on port 8000, activates venv, starts uvicorn with hot-reload.
+Starts llama.cpp LLM server (Docker, port 8003) if not running, kills any process on port 8000, activates venv, starts uvicorn with hot-reload.
+
+### Stop everything
+```powershell
+.\stop.ps1
+```
+Stops API server (port 8000) and llama.cpp LLM container.
 
 ### Start Gradio frontend (separate terminal)
 ```bash
@@ -54,8 +60,11 @@ curl -X POST http://localhost:8000/v1/audio/transcriptions \
 | `config.py` | Singleton `Config`, reads all env vars |
 | `app.py` | Gradio frontend — single file + batch upload UI |
 | `models.py` | Pydantic models (`WhisperSegment`, `TranscriptionResponse`) |
+| `entity_extraction.py` | LLM-based entity extraction (people, projects, orgs, brands) via OpenAI-compatible API |
 | `benchmark.py` | API benchmark script — sequential or concurrent file testing |
 | `main.py` | uvicorn entrypoint |
+| `start_llm.sh` | Docker launcher for llama.cpp LLM server (port 8003) |
+| `stop_llm.sh` | Stop llama.cpp LLM container |
 
 ---
 
@@ -86,6 +95,12 @@ BATCH_QUEUE_MAX_WAIT=0.5        # max seconds to wait before flushing an incompl
 
 # Reliability
 REQUEST_TIMEOUT=300             # seconds before 504 timeout (0 = no timeout)
+
+# Entity extraction (llama.cpp server via Docker on port 8003)
+ENABLE_ENTITY_EXTRACTION=true
+LLM_BASE_URL=http://localhost:8003/v1
+LLM_MODEL=Qwen3.5-9B-Q4_K_M
+LLM_TIMEOUT=300
 
 # Optional
 MODEL_ID=nvidia/parakeet-tdt-0.6b-v2

@@ -49,8 +49,8 @@ async def extract_entities(
 
     Args:
         transcript: The diarized transcript text
-        llm_base_url: Base URL of the OpenAI-compatible API (e.g. http://localhost:11434/v1)
-        llm_model: Model name (e.g. "granite3.3:8b", "llama3.1:8b")
+        llm_base_url: Base URL of the OpenAI-compatible API (e.g. http://localhost:8003/v1)
+        llm_model: Model name (e.g. "Qwen3.5-9B-Q4_K_M")
         timeout: Request timeout in seconds
 
     Returns:

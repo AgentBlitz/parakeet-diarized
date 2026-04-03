@@ -99,8 +99,8 @@ class Config:
 
         # Entity extraction (local LLM via OpenAI-compatible API)
         self.enable_entity_extraction = os.environ.get("ENABLE_ENTITY_EXTRACTION", "false").strip().lower() == "true"
-        self.llm_base_url = os.environ.get("LLM_BASE_URL", "http://localhost:11434/v1").strip()
-        self.llm_model = os.environ.get("LLM_MODEL", "qwen3.5:9b").strip()
+        self.llm_base_url = os.environ.get("LLM_BASE_URL", "http://localhost:8003/v1").strip()
+        self.llm_model = os.environ.get("LLM_MODEL", "Qwen3.5-9B-Q4_K_M").strip()
         self.llm_timeout = float(os.environ.get("LLM_TIMEOUT", "120").strip())
 
         # File paths
