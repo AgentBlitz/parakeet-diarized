@@ -17,6 +17,7 @@ from transcription import load_model, format_srt, format_vtt, transcribe_audio_b
 from diarization import Diarizer
 from batching import BatchingEngine
 from config import get_config
+from entity_extraction import extract_entities
 
 # Initialize logging
 logger = logging.getLogger(__name__)
@@ -135,7 +136,8 @@ def create_app() -> FastAPI:
         vad_filter: bool = Form(False),
         word_timestamps: bool = Form(False),
         diarize: bool = Form(True),
-        include_diarization_in_text: Optional[bool] = Form(None)
+        include_diarization_in_text: Optional[bool] = Form(None),
+        analyze: bool = Form(False),
     ):
         """
         Transcribe audio file using the Parakeet-TDT model
@@ -328,13 +330,34 @@ def create_app() -> FastAPI:
                 logger.warning("Diarization not applied or returned no speakers")
 
 
+            # --- Entity Extraction (optional, runs after transcription) ---
+            extracted_entities = None
+            entities_error = None
+
+            if analyze and config.enable_entity_extraction:
+                try:
+                    logger.info("Starting entity extraction via local LLM")
+                    extracted_entities = await extract_entities(
+                        transcript=full_text,
+                        llm_base_url=config.llm_base_url,
+                        llm_model=config.llm_model,
+                        timeout=config.llm_timeout,
+                    )
+                except Exception as e:
+                    logger.error(f"Entity extraction failed: {e}")
+                    entities_error = str(e)
+            elif analyze and not config.enable_entity_extraction:
+                entities_error = "Entity extraction not enabled (set ENABLE_ENTITY_EXTRACTION=true)"
+
             # Create response
             response = TranscriptionResponse(
                 text=full_text,
                 segments=all_segments if timestamps or response_format == "verbose_json" else None,
                 language=language,
                 duration=sum(len(segment.text.split()) for segment in all_segments) / 150 if all_segments else 0,
-                model="parakeet-tdt-0.6b-v2"
+                model="parakeet-tdt-0.6b-v2",
+                entities=extracted_entities,
+                entities_error=entities_error,
             )
             t_phase3_done = time.perf_counter()
 

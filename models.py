@@ -23,6 +23,8 @@ class TranscriptionResponse(BaseModel):
     task: str = "transcribe"
     duration: Optional[float] = None
     model: Optional[str] = None
+    entities: Optional[Dict[str, List[str]]] = None  # {people: [...], projects: [...], ...}
+    entities_error: Optional[str] = None  # Error message if entity extraction failed
     
     class Config:
         json_schema_extra = {"example": {"text": "Hello world", "segments": []}}

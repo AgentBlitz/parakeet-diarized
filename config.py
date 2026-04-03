@@ -97,6 +97,12 @@ class Config:
         self.enable_batch_queue = os.environ.get("ENABLE_BATCH_QUEUE", "false").strip().lower() == "true"
         self.batch_queue_max_wait = float(os.environ.get("BATCH_QUEUE_MAX_WAIT", "0.5").strip())
 
+        # Entity extraction (local LLM via OpenAI-compatible API)
+        self.enable_entity_extraction = os.environ.get("ENABLE_ENTITY_EXTRACTION", "false").strip().lower() == "true"
+        self.llm_base_url = os.environ.get("LLM_BASE_URL", "http://localhost:11434/v1").strip()
+        self.llm_model = os.environ.get("LLM_MODEL", "qwen3.5:9b").strip()
+        self.llm_timeout = float(os.environ.get("LLM_TIMEOUT", "120").strip())
+
         # File paths
         self.temp_dir = os.environ.get("TEMP_DIR", "/tmp/parakeet")
         Path(self.temp_dir).mkdir(parents=True, exist_ok=True)
@@ -134,6 +140,8 @@ class Config:
             "torch_compile_mode": self.torch_compile_mode,
             "request_timeout": self.request_timeout,
             "enable_batch_queue": self.enable_batch_queue,
+            "enable_entity_extraction": self.enable_entity_extraction,
+            "llm_model": self.llm_model if self.enable_entity_extraction else None,
         }
 
 
