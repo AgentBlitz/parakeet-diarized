@@ -121,6 +121,25 @@ if [[ -n "$HF_TOKEN" ]]; then
     export HUGGINGFACE_ACCESS_TOKEN="$HF_TOKEN"
 fi
 
+# Start Ollama if not already running (LLM sidecar for meeting intelligence)
+if curl -sf http://localhost:11434/api/tags &>/dev/null; then
+    echo -e "${GREEN}Ollama already running.${NC}"
+else
+    echo -e "${YELLOW}Starting Ollama...${NC}"
+    ollama serve &>/dev/null &
+    # Wait up to 15s for Ollama to become responsive
+    for i in {1..15}; do
+        if curl -sf http://localhost:11434/api/tags &>/dev/null; then
+            echo -e "${GREEN}Ollama started successfully.${NC}"
+            break
+        fi
+        sleep 1
+    done
+    if ! curl -sf http://localhost:11434/api/tags &>/dev/null; then
+        echo -e "${RED}WARNING: Ollama failed to start. LLM features will be unavailable.${NC}"
+    fi
+fi
+
 # Run the server
 echo -e "${GREEN}Starting server on ${HOST}:${PORT}...${NC}"
 if [[ $DEBUG -eq 1 ]]; then
