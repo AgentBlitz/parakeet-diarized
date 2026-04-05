@@ -163,6 +163,7 @@ HTTP POST /v1/audio/transcriptions
 | `torch.compile(mode="reduce-overhead")` fails in WSL with `PermissionError: nvcc` | WSL can't access `nvcc` for CUDA graph compilation. Use `mode="default"` (inductor backend) instead. |
 | Windows CRLF in `.env` breaks boolean env var parsing | `os.environ.get("VAR").lower() == "true"` fails because value has trailing `\r`. Always `.strip()` before comparing. |
 | `finally` cleanup deletes WAV while diarize_task is still reading it | Must cancel/await `diarize_task` before unlinking temp files. Initialize `diarize_task = None` before try block. |
+| Windows CRLF in `.sh` files breaks bash execution (`$'\r': command not found`) | Added `.gitattributes` with `*.sh text eol=lf` to force LF checkout. Git `core.autocrlf=true` on Windows converts LF→CRLF on checkout; `.gitattributes` overrides this for shell scripts. |
 
 ---
 
@@ -205,3 +206,5 @@ Speaker labels are auto-detected; users can rename them in the table before expo
 - `.\start.ps1` handles the WSL invocation from PowerShell
 - Harmless noise in logs: `UtilTranslatePathList Z:\bin` (WSL path warning), NvOneLogger/telemetry warnings
 - Empty chunks (silence at start/end of recording) are normal — produce `("", [])` and are skipped
+- **Shell scripts get CRLF on Windows checkout** — `git config core.autocrlf=true` converts LF→CRLF for all text files. `.gitattributes` overrides this for `*.sh` files, forcing LF. If a new `.sh` file is added, it's automatically covered.
+- **Docker Desktop must be running** before `.\start.ps1` — the llama.cpp LLM server (`start_llm.sh`) uses Docker. Start Docker Desktop on Windows first, or the script will fail with `failed to connect to the docker API at unix:///var/run/docker.sock`.
