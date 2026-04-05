@@ -1,5 +1,7 @@
 import asyncio
+import json
 import os
+import struct
 import tempfile
 import logging
 import subprocess
@@ -9,6 +11,74 @@ from typing import List, Optional, Dict, Any, Union
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def _probe_input_file(audio_path: str) -> None:
+    """Log codec/format info of the input file via ffprobe."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "quiet",
+                "-print_format", "json",
+                "-show_format", "-show_streams",
+                audio_path,
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            logger.warning(f"ffprobe failed: {result.stderr[:200]}")
+            return
+
+        info = json.loads(result.stdout)
+        fmt = info.get("format", {})
+        logger.info(
+            f"Input probe: format={fmt.get('format_name')} duration={fmt.get('duration')}s "
+            f"size={fmt.get('size')} bitrate={fmt.get('bit_rate')}"
+        )
+        for s in info.get("streams", []):
+            if s.get("codec_type") == "audio":
+                logger.info(
+                    f"  audio stream: codec={s.get('codec_name')} "
+                    f"sample_rate={s.get('sample_rate')} channels={s.get('channels')} "
+                    f"channel_layout={s.get('channel_layout')} "
+                    f"bits_per_sample={s.get('bits_per_sample')}"
+                )
+    except Exception as e:
+        logger.warning(f"ffprobe error: {e}")
+
+
+def _log_wav_properties(wav_path: str) -> None:
+    """Read the converted WAV and log sample rate, duration, peak & RMS amplitude."""
+    try:
+        with wave.open(wav_path, "rb") as wf:
+            n_channels = wf.getnchannels()
+            sample_rate = wf.getframerate()
+            n_frames = wf.getnframes()
+            duration = n_frames / sample_rate if sample_rate else 0
+            raw = wf.readframes(n_frames)
+
+        # Decode int16 samples
+        n_samples = len(raw) // 2
+        if n_samples == 0:
+            logger.warning(f"WAV diagnostic: {wav_path} has 0 samples (empty file)")
+            return
+
+        samples = struct.unpack(f"<{n_samples}h", raw)
+        peak = max(abs(s) for s in samples)
+        rms = math.sqrt(sum(s * s for s in samples) / n_samples)
+
+        logger.info(
+            f"WAV diagnostic: rate={sample_rate} ch={n_channels} frames={n_frames} "
+            f"duration={duration:.2f}s peak={peak} rms={rms:.1f} "
+            f"file_size={os.path.getsize(wav_path)}"
+        )
+        if peak < 100:
+            logger.warning(
+                f"WAV appears SILENT (peak={peak} < 100 on int16 scale) — "
+                f"ffmpeg may have failed to decode the input audio"
+            )
+    except Exception as e:
+        logger.warning(f"WAV diagnostic error: {e}")
 
 def split_audio_into_chunks(audio_path: str, chunk_duration: int = 300) -> List[str]:
     """
@@ -93,6 +163,9 @@ def convert_audio_to_wav(audio_path: str) -> str:
     output_path = temp_file.name
     
     try:
+        # Probe input file for codec/format diagnostics
+        _probe_input_file(audio_path)
+
         # Use ffmpeg to convert audio
         cmd = [
             "ffmpeg",
@@ -103,14 +176,21 @@ def convert_audio_to_wav(audio_path: str) -> str:
             "-ac", "1",  # Mono audio
             output_path
         ]
-        
+
         logger.debug(f"Running ffmpeg command: {' '.join(cmd)}")
         result = subprocess.run(cmd, capture_output=True, text=True)
-        
+
         if result.returncode != 0:
             logger.error(f"Error converting audio: {result.stderr}")
             raise Exception(f"Failed to convert audio: {result.stderr}")
-            
+
+        # Log stderr even on success — catches codec warnings
+        if result.stderr:
+            logger.debug(f"ffmpeg stderr (success): {result.stderr[:500]}")
+
+        # Diagnostic: log WAV properties to catch silent/corrupt output
+        _log_wav_properties(output_path)
+
         return output_path
         
     except Exception as e:

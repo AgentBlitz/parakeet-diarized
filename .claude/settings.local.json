@@ -34,7 +34,9 @@
       "Bash(grep -r 'class ASRTranscriptionMixin' /c/_Dev/parakeet-diarized/venv/Lib/site-packages/nemo/collections/asr --include=*.py)",
       "Bash(grep -r \"memory_reserved\\\\|memory_allocated\\\\|empty_cache\\\\|cuda.empty_cache\" /c/_Dev/parakeet-diarized/venv/Lib/site-packages/pyannote --include=*.py)",
       "Bash(grep -r \"memory_reserved\\\\|memory_allocated\\\\|empty_cache\\\\|cuda.empty_cache\" /c/_Dev/parakeet-diarized/venv/Lib/site-packages/nemo --include=*.py)",
-      "Bash(curl -v https://registry.ollama.ai/v2/library/qwen3.5/manifests/9b)"
+      "Bash(curl -v https://registry.ollama.ai/v2/library/qwen3.5/manifests/9b)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('api.py'\\).read\\(\\)\\); print\\('api.py: OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('models.py'\\).read\\(\\)\\); print\\('models.py: OK'\\)\")"
     ]
   },
   "disabledMcpjsonServers": [
