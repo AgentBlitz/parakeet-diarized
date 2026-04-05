@@ -2,6 +2,8 @@ import asyncio
 import os
 import logging
 import time
+import uuid
+from datetime import datetime, timezone
 from functools import partial
 from typing import List, Optional, Dict, Any, Union
 from pathlib import Path
@@ -11,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 import torch
 
-from models import WhisperSegment, TranscriptionResponse, ModelInfo, ModelList
+from models import WhisperSegment, TranscriptionResponse, ModelInfo, ModelList, JobSubmitResponse, JobStatusResponse
 from audio import convert_audio_to_wav, split_audio_into_chunks_async
 from transcription import load_model, format_srt, format_vtt, transcribe_audio_batch
 from diarization import Diarizer
@@ -463,5 +465,312 @@ def create_app() -> FastAPI:
         ]
 
         return ModelList(data=models)
+
+    # --- Async Job Queue ---
+    # In-memory job store: job_id (str) -> job record (dict)
+    job_store: Dict[str, dict] = {}
+
+    async def _cleanup_expired_jobs():
+        """Background task to expire jobs older than 1 hour. Runs every 10 minutes."""
+        while True:
+            await asyncio.sleep(600)  # 10 minutes
+            now = datetime.now(timezone.utc)
+            expired = [
+                jid for jid, job in job_store.items()
+                if (now - job["created_at"]).total_seconds() > 3600
+            ]
+            for jid in expired:
+                del job_store[jid]
+            if expired:
+                logger.info(f"Job cleanup: expired {len(expired)} job(s), {len(job_store)} remaining")
+
+    @app.on_event("startup")
+    async def startup_job_cleanup():
+        """Start the job cleanup background task"""
+        asyncio.create_task(_cleanup_expired_jobs())
+
+    async def _run_transcription(
+        file_bytes: bytes,
+        filename: str,
+        diarize: bool = True,
+        analyze: bool = False,
+    ) -> dict:
+        """
+        Core transcription logic shared by the sync endpoint and async job queue.
+        Accepts raw file bytes (not UploadFile) so it can run in a background task.
+        Returns a TranscriptionResponse dict with segments always included.
+        """
+        global asr_model, diarizer_instance, transcribe_semaphore, diarize_semaphore
+
+        if not asr_model:
+            raise RuntimeError("Model not loaded yet")
+
+        t_request = time.perf_counter()
+        temp_file = None
+        wav_file = None
+        audio_chunks = []
+        diarize_task = None
+
+        try:
+            # --- Phase 1: File I/O ---
+            t_phase1 = time.perf_counter()
+
+            temp_dir = Path(config.temp_dir)
+            temp_dir.mkdir(parents=True, exist_ok=True)
+
+            temp_file = temp_dir / f"upload_{os.urandom(8).hex()}{Path(filename).suffix}"
+            with open(temp_file, "wb") as f:
+                f.write(file_bytes)
+
+            chunk_duration = config.chunk_duration
+            loop = asyncio.get_event_loop()
+
+            t_wav = time.perf_counter()
+            wav_file = await loop.run_in_executor(None, convert_audio_to_wav, str(temp_file))
+            t_wav_done = time.perf_counter()
+
+            audio_chunks = await split_audio_into_chunks_async(wav_file, chunk_duration=chunk_duration)
+            t_phase1_done = time.perf_counter()
+
+            diarizer = diarizer_instance if diarize else None
+            if diarize and not diarizer:
+                logger.warning("Diarization requested but diarizer not initialized (no HuggingFace token)")
+
+            # --- Phase 2: GPU work ---
+            t_phase2 = time.perf_counter()
+            diarization_result = None
+            batch_results = []
+
+            async def _run_diarize():
+                async with diarize_semaphore:
+                    logger.info("Performing speaker diarization")
+                    result = await loop.run_in_executor(
+                        None, partial(diarizer.diarize, wav_file)
+                    )
+                    logger.info(f"Diarization found {result.num_speakers} speakers")
+                    return result
+
+            diarize_task = asyncio.create_task(_run_diarize()) if diarizer else None
+
+            logger.info(f"Batch transcribing {len(audio_chunks)} chunk(s) with batch_size={config.batch_size}")
+            t_transcribe = time.perf_counter()
+
+            if batching_engine:
+                request_id = os.urandom(4).hex()
+                try:
+                    batch_results = await asyncio.wait_for(
+                        batching_engine.submit_chunks(
+                            audio_chunks, request_id,
+                            batch_size=config.batch_size,
+                        ),
+                        timeout=config.request_timeout
+                    )
+                except asyncio.TimeoutError:
+                    raise RuntimeError(f"Transcription timed out after {config.request_timeout}s")
+            else:
+                async with transcribe_semaphore:
+                    try:
+                        batch_results = await asyncio.wait_for(
+                            loop.run_in_executor(
+                                None,
+                                partial(
+                                    transcribe_audio_batch,
+                                    asr_model,
+                                    audio_chunks,
+                                    config.batch_size,
+                                    None,  # language
+                                    False  # word_timestamps
+                                )
+                            ),
+                            timeout=config.request_timeout
+                        )
+                    except asyncio.TimeoutError:
+                        raise RuntimeError(f"Transcription timed out after {config.request_timeout}s")
+            t_transcribe_done = time.perf_counter()
+
+            t_diarize_elapsed = 0.0
+            if diarize_task:
+                t_diarize_wait = time.perf_counter()
+                diarization_result = await diarize_task
+                t_diarize_elapsed = time.perf_counter() - t_diarize_wait
+            t_phase2_done = time.perf_counter()
+
+            # --- Phase 3: Assemble results ---
+            t_phase3 = time.perf_counter()
+            all_text = []
+            all_segments = []
+
+            for i, (chunk_text, chunk_segments) in enumerate(batch_results):
+                offset = i * chunk_duration
+                if offset > 0:
+                    for segment in chunk_segments:
+                        segment.start += offset
+                        segment.end += offset
+                all_text.append(chunk_text)
+                all_segments.extend(chunk_segments)
+
+            full_text = " ".join(all_text)
+
+            if diarizer and diarization_result and diarization_result.segments:
+                logger.info(f"Found {diarization_result.num_speakers} speakers")
+                all_segments = diarizer.merge_with_transcription(diarization_result, all_segments)
+
+                # Always include diarization in text for job results
+                previous_speaker = None
+                seen_speakers = set()
+
+                for segment in all_segments:
+                    if hasattr(segment, 'speaker') and segment.speaker:
+                        speaker_label = segment.speaker
+                        if speaker_label.startswith("speaker_"):
+                            try:
+                                parts = speaker_label.split("_")
+                                speaker_num = int(parts[-1]) + 1
+
+                                if speaker_label != previous_speaker:
+                                    if speaker_label not in seen_speakers:
+                                        prefix = f"Speaker {speaker_num}: "
+                                        seen_speakers.add(speaker_label)
+                                    else:
+                                        prefix = f"{speaker_num}: "
+                                    segment.text = f"{prefix}{segment.text}"
+
+                                previous_speaker = speaker_label
+                            except (ValueError, IndexError):
+                                if "Speaker" != previous_speaker:
+                                    segment.text = f"Speaker: {segment.text}"
+                                    previous_speaker = "Speaker"
+
+                full_text = " ".join(segment.text for segment in all_segments)
+
+            # --- Entity Extraction ---
+            extracted_entities = None
+            entities_error = None
+
+            if analyze and config.enable_entity_extraction:
+                try:
+                    logger.info("Starting entity extraction via local LLM")
+                    extracted_entities = await extract_entities(
+                        transcript=full_text,
+                        llm_base_url=config.llm_base_url,
+                        llm_model=config.llm_model,
+                        timeout=config.llm_timeout,
+                    )
+                except Exception as e:
+                    logger.error(f"Entity extraction failed: {e}")
+                    entities_error = str(e)
+            elif analyze and not config.enable_entity_extraction:
+                entities_error = "Entity extraction not enabled (set ENABLE_ENTITY_EXTRACTION=true)"
+
+            response = TranscriptionResponse(
+                text=full_text,
+                segments=all_segments,
+                language=None,
+                duration=sum(len(segment.text.split()) for segment in all_segments) / 150 if all_segments else 0,
+                model="parakeet-tdt-0.6b-v2",
+                entities=extracted_entities,
+                entities_error=entities_error,
+            )
+            t_phase3_done = time.perf_counter()
+
+            audio_dur = len(audio_chunks) * chunk_duration if audio_chunks else 0
+            total_time = t_phase3_done - t_request
+            rtf = total_time / audio_dur if audio_dur > 0 else 0
+            logger.info(
+                f"timing: phase1={t_phase1_done - t_phase1:.2f}s"
+                f"(wav={t_wav_done - t_wav:.2f}s chunks={t_phase1_done - t_wav_done:.2f}s) "
+                f"phase2={t_phase2_done - t_phase2:.2f}s"
+                f"(transcribe={t_transcribe_done - t_transcribe:.2f}s diarize_wait={t_diarize_elapsed:.2f}s) "
+                f"phase3={t_phase3_done - t_phase3:.2f}s "
+                f"total={total_time:.2f}s chunks={len(audio_chunks)} "
+                f"audio~{audio_dur}s rtf={rtf:.4f}"
+            )
+
+            return response.dict()
+
+        finally:
+            if diarize_task and not diarize_task.done():
+                try:
+                    diarize_task.cancel()
+                    await diarize_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            for path in [temp_file, wav_file]:
+                if path and os.path.exists(path):
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+            for chunk in audio_chunks:
+                if chunk and chunk != str(wav_file) and os.path.exists(chunk):
+                    try:
+                        os.unlink(chunk)
+                    except OSError:
+                        pass
+
+    @app.post("/v1/jobs", response_model=JobSubmitResponse)
+    async def submit_job(
+        file: UploadFile = File(...),
+        diarize: bool = Form(True),
+        analyze: bool = Form(False),
+    ):
+        """Submit audio for async transcription. Returns immediately with a job ID."""
+        if not asr_model:
+            raise HTTPException(status_code=503, detail="Model not loaded yet. Please try again in a few moments.")
+
+        # Read file bytes now — UploadFile won't be available after the request returns
+        file_bytes = await file.read()
+        filename = file.filename or "upload.webm"
+
+        job_id = str(uuid.uuid4())
+        job_store[job_id] = {
+            "job_id": job_id,
+            "status": "queued",
+            "result": None,
+            "error_message": None,
+            "created_at": datetime.now(timezone.utc),
+        }
+
+        async def _process_job():
+            job_store[job_id]["status"] = "processing"
+            try:
+                result = await _run_transcription(file_bytes, filename, diarize, analyze)
+                job_store[job_id]["result"] = result
+                job_store[job_id]["status"] = "completed"
+                logger.info(f"Job {job_id} completed")
+            except Exception as e:
+                job_store[job_id]["error_message"] = str(e)
+                job_store[job_id]["status"] = "failed"
+                logger.error(f"Job {job_id} failed: {e}")
+
+        asyncio.create_task(_process_job())
+        logger.info(f"Job {job_id} queued for {filename} (diarize={diarize}, analyze={analyze})")
+
+        return JobSubmitResponse(job_id=job_id, status="queued")
+
+    @app.get("/v1/jobs/{job_id}", response_model=JobStatusResponse)
+    async def get_job_status(job_id: str):
+        """Check the status of a transcription job."""
+        job = job_store.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found or expired")
+        return JobStatusResponse(
+            job_id=job["job_id"],
+            status=job["status"],
+            error_message=job["error_message"],
+        )
+
+    @app.get("/v1/jobs/{job_id}/result")
+    async def get_job_result(job_id: str):
+        """Fetch the transcription result for a completed job."""
+        job = job_store.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found or expired")
+        if job["status"] != "completed":
+            return JSONResponse(
+                status_code=409,
+                content={"error": "Job not yet completed", "status": job["status"]},
+            )
+        return job["result"]
 
     return app

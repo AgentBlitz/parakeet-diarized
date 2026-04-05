@@ -37,6 +37,17 @@ class TranscriptionResponse(BaseModel):
             result.pop("segments", None)
         return result
 
+class JobSubmitResponse(BaseModel):
+    """Response from submitting an async transcription job"""
+    job_id: str
+    status: str
+
+class JobStatusResponse(BaseModel):
+    """Response from checking job status"""
+    job_id: str
+    status: str
+    error_message: Optional[str] = None
+
 class ModelInfo(BaseModel):
     """Information about a model available in the API"""
     id: str
