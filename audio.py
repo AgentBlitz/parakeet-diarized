@@ -47,8 +47,9 @@ def _probe_input_file(audio_path: str) -> None:
         logger.warning(f"ffprobe error: {e}")
 
 
-def _log_wav_properties(wav_path: str) -> None:
-    """Read the converted WAV and log sample rate, duration, peak & RMS amplitude."""
+def _log_wav_properties(wav_path: str) -> int:
+    """Read the converted WAV and log sample rate, duration, peak & RMS amplitude.
+    Returns peak amplitude (0 if file is empty or unreadable)."""
     try:
         with wave.open(wav_path, "rb") as wf:
             n_channels = wf.getnchannels()
@@ -61,7 +62,7 @@ def _log_wav_properties(wav_path: str) -> None:
         n_samples = len(raw) // 2
         if n_samples == 0:
             logger.warning(f"WAV diagnostic: {wav_path} has 0 samples (empty file)")
-            return
+            return 0
 
         samples = struct.unpack(f"<{n_samples}h", raw)
         peak = max(abs(s) for s in samples)
@@ -77,8 +78,10 @@ def _log_wav_properties(wav_path: str) -> None:
                 f"WAV appears SILENT (peak={peak} < 100 on int16 scale) — "
                 f"ffmpeg may have failed to decode the input audio"
             )
+        return peak
     except Exception as e:
         logger.warning(f"WAV diagnostic error: {e}")
+        return 0
 
 def split_audio_into_chunks(audio_path: str, chunk_duration: int = 300) -> List[str]:
     """
@@ -189,7 +192,13 @@ def convert_audio_to_wav(audio_path: str) -> str:
             logger.debug(f"ffmpeg stderr (success): {result.stderr[:500]}")
 
         # Diagnostic: log WAV properties to catch silent/corrupt output
-        _log_wav_properties(output_path)
+        peak = _log_wav_properties(output_path)
+        if peak == 0:
+            raise Exception(
+                "Audio conversion produced a completely silent WAV (peak=0). "
+                "The input file likely contains no audio data. "
+                f"Input size: {os.path.getsize(audio_path)} bytes"
+            )
 
         return output_path
         
