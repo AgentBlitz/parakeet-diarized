@@ -265,6 +265,31 @@ async def split_audio_into_chunks_async(audio_path: str, chunk_duration: int = 3
                     raise RuntimeError(f"ffmpeg chunk {i} failed: {stderr.decode()}")
 
         await asyncio.gather(*[extract_chunk(i) for i in range(num_chunks)])
+
+        # Diagnostic: log WAV properties of each chunk to catch silent/corrupt splits
+        for i, cp in enumerate(chunk_paths):
+            try:
+                with wave.open(cp, "rb") as wf:
+                    ch_frames = wf.getnframes()
+                    ch_rate = wf.getframerate()
+                    ch_dur = ch_frames / ch_rate if ch_rate else 0
+                    raw = wf.readframes(ch_frames)
+                n_samples = len(raw) // 2
+                if n_samples > 0:
+                    samples = struct.unpack(f"<{n_samples}h", raw)
+                    peak = max(abs(s) for s in samples)
+                    rms = math.sqrt(sum(s * s for s in samples) / n_samples)
+                else:
+                    peak, rms = 0, 0.0
+                logger.info(
+                    f"Chunk {i} diagnostic: duration={ch_dur:.2f}s frames={ch_frames} "
+                    f"peak={peak} rms={rms:.1f} size={os.path.getsize(cp)}"
+                )
+                if peak < 100:
+                    logger.warning(f"Chunk {i} appears SILENT (peak={peak})")
+            except Exception as e:
+                logger.warning(f"Chunk {i} diagnostic error: {e}")
+
         return chunk_paths
 
     except Exception as e:

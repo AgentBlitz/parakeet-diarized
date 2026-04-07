@@ -1,5 +1,6 @@
 import os
 import logging
+import shutil
 import tempfile
 import time
 from typing import List, Optional, Dict, Any, Union, Tuple
@@ -159,7 +160,14 @@ def _parse_hypothesis(result, model) -> Tuple[str, List[WhisperSegment]]:
         result = result[0] if len(result) > 0 else ""
 
     text = result.text if hasattr(result, 'text') else str(result)
-    logger.info(f"Parsed hypothesis type={type(result).__name__}, text length={len(text)}, preview={repr(text[:80])}")
+    # Log hypothesis quality metrics for diagnosing sparse output
+    score = getattr(result, 'score', None)
+    y_seq = getattr(result, 'y_sequence', None)
+    y_shape = y_seq.shape if hasattr(y_seq, 'shape') else None
+    logger.info(
+        f"Parsed hypothesis type={type(result).__name__}, text length={len(text)}, "
+        f"score={score}, y_sequence_shape={y_shape}, preview={repr(text[:80])}"
+    )
     if not text:
         ts_attrs = {a: type(getattr(result, a, None)).__name__ for a in ('timestamp', 'timestep', 'score', 'y_sequence')}
         logger.warning(f"Empty transcription. Hypothesis attrs: {ts_attrs}")
@@ -236,14 +244,17 @@ def transcribe_audio_batch(
     t_start = time.perf_counter()
     with torch.no_grad():
         try:
+            # use_lhotse=False: bypass Lhotse DynamicBucketingSampler which can silently
+            # truncate/corrupt audio in small batches. Legacy NeMo dataloader reads WAVs directly.
             transcriptions = model.transcribe(
                 list(valid_paths),
                 batch_size=batch_size,
-                return_hypotheses=True
+                return_hypotheses=True,
+                use_lhotse=False,
             )
         except Exception as e:
             logger.warning(f"Batch transcription with return_hypotheses failed ({e}), retrying plain")
-            transcriptions = model.transcribe(list(valid_paths), batch_size=batch_size)
+            transcriptions = model.transcribe(list(valid_paths), batch_size=batch_size, use_lhotse=False)
     t_elapsed = time.perf_counter() - t_start
 
     # Log GPU memory after transcription and timing
@@ -268,7 +279,26 @@ def transcribe_audio_batch(
         transcriptions = transcriptions[1]
 
     for orig_i, hyp in zip(valid_indices, transcriptions):
-        results[orig_i] = _parse_hypothesis(hyp, model)
+        text, segments = _parse_hypothesis(hyp, model)
+        results[orig_i] = (text, segments)
+        # Log per-chunk output to diagnose sparse transcriptions
+        chunk_path = valid_paths[list(valid_indices).index(orig_i)]
+        chunk_size = os.path.getsize(chunk_path)
+        logger.info(
+            f"Chunk {orig_i}: {len(text)} chars, {len(segments)} segments, "
+            f"file_size={chunk_size}, text={repr(text[:120])}"
+        )
+        if chunk_size > 10000 and len(text) < 10:
+            logger.warning(
+                f"Chunk {orig_i}: suspiciously sparse output — "
+                f"{chunk_size} byte WAV produced only {len(text)} chars"
+            )
+            # Save failing chunk for offline debugging
+            debug_dir = "/tmp/parakeet/debug"
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_path = os.path.join(debug_dir, f"sparse_chunk_{orig_i}_{os.path.basename(chunk_path)}")
+            shutil.copy2(chunk_path, debug_path)
+            logger.warning(f"Saved sparse chunk to {debug_path} for debugging")
 
     return results
 
